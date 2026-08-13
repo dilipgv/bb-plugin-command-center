@@ -67,26 +67,6 @@ const needsInputItem = z.object({
   askerThreadId: z.string().nullable(),
 });
 
-/** A task nobody has finished yet, with whoever is on it. */
-const inFlightTask = z.object({
-  taskId: z.string(),
-  key: z.string(),
-  title: z.string(),
-  status: z.string(),
-  priority: z.string(),
-  projectName: z.string().nullable(),
-  updatedAt: z.string().nullable(),
-  workers: z.array(
-    z.object({
-      threadId: z.string(),
-      title: z.string().nullable(),
-      /** The tasks plugin's own view of the attached thread. */
-      liveStatus: z.string().nullable(),
-      /** True when this thread is one Chief's org spawned. */
-      isChiefOrg: z.boolean(),
-    }),
-  ),
-});
 
 /** One project chief and the architects it is running. */
 const projectGroup = z.object({
@@ -99,7 +79,6 @@ const projectGroup = z.object({
 export type ChiefNavThread = z.infer<typeof navThread>;
 export type ChiefNavNeedsInput = z.infer<typeof needsInputItem>;
 export type ChiefNavGroup = z.infer<typeof projectGroup>;
-export type ChiefNavTask = z.infer<typeof inFlightTask>;
 
 export const rpcContract = defineRpcContract({
   state: {
@@ -113,17 +92,6 @@ export const rpcContract = defineRpcContract({
       needsInput: z.array(needsInputItem),
       /** Non-null only when the Inbox plugin is unreachable. */
       needsInputError: z.string().nullable(),
-    }),
-  },
-  /** Everything unfinished on the task board — Chief's work and anyone else's. */
-  inFlight: {
-    input: z.null(),
-    output: z.object({
-      tasks: z.array(inFlightTask),
-      /** Non-null only when the Tasks plugin is unreachable. */
-      error: z.string().nullable(),
-      /** True when the board had more tasks than this response carries. */
-      truncated: z.boolean(),
     }),
   },
   ensureChief: {
@@ -428,146 +396,6 @@ export async function registerChief(
     return { items: deps.openQuestions(), error: null };
   }
 
-  /** Terminal task statuses — everything else counts as in flight. */
-  const FINISHED_STATUSES = new Set(["done", "canceled", "cancelled"]);
-  /** Lane order for the in-flight list; unknown statuses sort last. */
-  const LANE_ORDER = [
-    "in_progress",
-    "in_review",
-    "needs_input",
-    "todo",
-    "ready",
-    "backlog",
-  ];
-  /** Hard cap on tasks we resolve workers for — one rpc per task. */
-  const IN_FLIGHT_LIMIT = 60;
-
-  /**
-   * The task board's unfinished rows, with the threads attached to each.
-   *
-   * This reads the Tasks plugin over `plugins.callRpc`. That is another
-   * plugin's contract, not a public API, so every field is validated loosely
-   * and any failure degrades to an empty list with a reason rather than
-   * breaking the panel.
-   */
-  async function inFlightTasks(): Promise<{
-    tasks: z.infer<typeof inFlightTask>[];
-    error: string | null;
-    truncated: boolean;
-  }> {
-    try {
-      const projects = await bb.sdk.plugins.callRpc({
-        pluginId: "tasks",
-        method: "listProjects",
-        input: {},
-        outputSchema: z.object({
-          projects: z.array(
-            z.looseObject({ id: z.string(), name: z.string().nullish() }),
-          ),
-        }),
-      });
-      const projectNames = new Map(
-        projects.projects.map((project) => [project.id, project.name ?? null]),
-      );
-
-      const taskSchema = z.object({
-        tasks: z.array(
-          z.looseObject({
-            id: z.string(),
-            key: z.string(),
-            title: z.string(),
-            status: z.string(),
-            priority: z.string().nullish(),
-            projectId: z.string().nullish(),
-            updatedAt: z.string().nullish(),
-          }),
-        ),
-        nextCursor: z.string().nullish(),
-      });
-
-      const rows: z.output<typeof taskSchema>["tasks"] = [];
-      let cursor: string | null = null;
-      // Page the board, but stop well before a runaway loop.
-      for (let page = 0; page < 10; page += 1) {
-        const result: z.output<typeof taskSchema> =
-          await bb.sdk.plugins.callRpc({
-            pluginId: "tasks",
-            method: "listTasks",
-            input: cursor ? { cursor } : {},
-            outputSchema: taskSchema,
-          });
-        rows.push(...result.tasks);
-        cursor = result.nextCursor ?? null;
-        if (!cursor) break;
-      }
-
-      const open = rows
-        .filter((row) => !FINISHED_STATUSES.has(row.status))
-        .sort((left, right) => {
-          const lane =
-            (LANE_ORDER.indexOf(left.status) + 1 || 99) -
-            (LANE_ORDER.indexOf(right.status) + 1 || 99);
-          if (lane !== 0) return lane;
-          return (right.updatedAt ?? "").localeCompare(left.updatedAt ?? "");
-        });
-      const shown = open.slice(0, IN_FLIGHT_LIMIT);
-      if (open.length > shown.length) {
-        bb.log.info(
-          `in-flight list truncated: ${open.length} open tasks, showing ${shown.length}`,
-        );
-      }
-
-      const tasks = await Promise.all(
-        shown.map(async (row) => {
-          let workers: z.infer<typeof inFlightTask>["workers"] = [];
-          try {
-            const attached = await bb.sdk.plugins.callRpc({
-              pluginId: "tasks",
-              method: "listTaskThreads",
-              input: { taskId: row.id },
-              outputSchema: z.object({
-                taskThreads: z.array(
-                  z.looseObject({
-                    threadId: z.string(),
-                    title: z.string().nullish(),
-                    liveStatus: z.string().nullish(),
-                  }),
-                ),
-              }),
-            });
-            workers = attached.taskThreads.map((entry) => ({
-              threadId: entry.threadId,
-              title: entry.title ?? null,
-              liveStatus: entry.liveStatus ?? null,
-              isChiefOrg:
-                entry.threadId === chiefThreadId ||
-                projectChiefThreads.has(entry.threadId) ||
-                architectThreads.has(entry.threadId),
-            }));
-          } catch {
-            // A task whose threads cannot be read still belongs in the list.
-          }
-          return {
-            taskId: row.id,
-            key: row.key,
-            title: row.title,
-            status: row.status,
-            priority: row.priority ?? "none",
-            projectName: row.projectId
-              ? (projectNames.get(row.projectId) ?? null)
-              : null,
-            updatedAt: row.updatedAt ?? null,
-            workers,
-          };
-        }),
-      );
-
-      return { tasks, error: null, truncated: open.length > shown.length };
-    } catch (error) {
-      // The Tasks plugin is optional — the panel still works without it.
-      return { tasks: [], error: String(error), truncated: false };
-    }
-  }
 
   const bullets = (items?: string[]) =>
     items && items.length > 0
@@ -885,8 +713,6 @@ export async function registerChief(
         needsInputError: inbox.error,
       };
     },
-
-    inFlight: () => inFlightTasks(),
 
     ensureChief: () => ensureChief(),
 
