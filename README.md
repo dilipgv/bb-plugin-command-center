@@ -3,6 +3,13 @@
 The Captain's command center, and the Chief org behind it — one plugin, merged
 from the former `inbox` and `chief-nav`.
 
+The board runs Queue → In progress → In review → Done, with a derived Needs you
+lane. Moving a card into **Done is deliberately manual** — signing work off is
+the Captain's call, so agents park finished work in In review with
+`bb inbox ready <id>` (or by setting the task to `in_review`) and stop there.
+A review request (`bb inbox review …`) lands in In review too, since "look at
+this PR" and "read this doc" are sign-off, not a decision blocking an agent.
+
 Two lanes run in opposite directions through the board:
 
 - **Needs you** — questions, review requests and FYIs that agents raised with

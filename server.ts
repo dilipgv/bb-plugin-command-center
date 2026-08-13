@@ -42,6 +42,8 @@ const REQUEST_STATES = [
   "queued",
   "dispatched",
   "in_flight",
+  // Finished by the org, waiting on the Captain to sign it off.
+  "in_review",
   "done",
   "cancelled",
 ] as const;
@@ -110,16 +112,23 @@ const MAX_AUDIO_BASE64_LENGTH = 8_000_000;
 
 // ------------------------------------------------------------------- board
 
-const LANES = ["queue", "in_progress", "needs_you", "done"] as const;
+const LANES = [
+  "queue",
+  "in_progress",
+  "in_review",
+  "needs_you",
+  "done",
+] as const;
 export type BoardLane = (typeof LANES)[number];
 
 /** Lane → BB task status, for writing a drag back to the task board. */
 const LANE_TASK_STATUS: Record<
   Exclude<BoardLane, "needs_you">,
-  "todo" | "in_progress" | "done"
+  "todo" | "in_progress" | "in_review" | "done"
 > = {
   queue: "todo",
   in_progress: "in_progress",
+  in_review: "in_review",
   done: "done",
 };
 
@@ -157,6 +166,21 @@ const boardCardDto = z.object({
   ),
   /** The open question holding this card in Needs you, when there is one. */
   question: itemDto.nullable(),
+  /** Pull requests behind this card. Only resolved for the In review lane. */
+  pullRequests: z.array(
+    z.object({
+      url: z.string(),
+      number: z.number(),
+      title: z.string(),
+      state: z.enum(["open", "draft", "merged", "closed"]),
+    }),
+  ),
+  /**
+   * True when a PR lookup could not answer (deleted thread, gh missing or
+   * unauthenticated). Without this an unreachable PR is indistinguishable from
+   * no PR at all — a bad failure mode for a lane about reviewing them.
+   */
+  pullRequestsUnavailable: z.boolean(),
   /** False for cards this panel may not move (bare questions). */
   movable: z.boolean(),
   /** True when moving out of Queue would dispatch work to Chief. */
@@ -1207,6 +1231,50 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  interface PullRequestLookup {
+    pullRequests: {
+      url: string;
+      number: number;
+      title: string;
+      state: "open" | "draft" | "merged" | "closed";
+    }[];
+    unavailable: boolean;
+  }
+
+  async function taskPullRequests(taskId: string): Promise<PullRequestLookup> {
+    try {
+      const result = await tasksCall(
+        "listTaskPullRequests",
+        { taskId },
+        z.object({
+          pullRequests: z.array(
+            z.looseObject({
+              url: z.string(),
+              number: z.number(),
+              title: z.string(),
+              state: z.enum(["open", "draft", "merged", "closed"]),
+            }),
+          ),
+          unavailableThreadIds: z.array(z.string()),
+        }),
+      );
+      return {
+        pullRequests: result.pullRequests.map((pr) => ({
+          url: pr.url,
+          number: pr.number,
+          title: pr.title,
+          state: pr.state,
+        })),
+        // Threads whose lookup failed are reported, not thrown — pass that on
+        // rather than letting it read as "no pull request".
+        unavailable: result.unavailableThreadIds.length > 0,
+      };
+    } catch {
+      // A PR lookup reaches the git host; a failure must not blank the board.
+      return { pullRequests: [], unavailable: true };
+    }
+  }
+
   async function taskCommentCount(taskId: string): Promise<number> {
     try {
       const result = await tasksCall(
@@ -1268,15 +1336,32 @@ export default async function plugin(bb: BbPluginApi) {
     return map;
   }
 
+  /**
+   * Where an open question puts its card. A review request — "look at this PR",
+   * "read this doc" — is work awaiting sign-off, not a decision blocking an
+   * agent, so it belongs in In review. Everything else demands an answer.
+   */
+  function questionLane(question: InboxItem): BoardLane {
+    return question.kind === "review" ? "in_review" : "needs_you";
+  }
+
   function laneForRequest(
     row: RequestRow,
     task: TaskRow | null,
     question: InboxItem | null,
   ): BoardLane {
     // A blocked card belongs where your attention is, whatever its status says.
-    if (question !== null) return "needs_you";
-    if (row.state === "done" || row.state === "cancelled") return "done";
+    if (question !== null) return questionLane(question);
+    // Abandoned is abandoned; there is nothing to sign off.
+    if (row.state === "cancelled") return "done";
+    // A task still in review outranks an agent that closed the request: moving
+    // work to Done is the Captain's step, and an eager `close` upstream must not
+    // skip it. Their own drag to Done writes the task done too, so the two only
+    // disagree when something below decided on their behalf.
+    if (task !== null && task.status === "in_review") return "in_review";
+    if (row.state === "done") return "done";
     if (task !== null && FINISHED_TASK_STATUSES.has(task.status)) return "done";
+    if (row.state === "in_review") return "in_review";
     if (row.state === "dispatched" || row.state === "in_flight") {
       return "in_progress";
     }
@@ -1284,11 +1369,10 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   function laneForTask(task: TaskRow, question: InboxItem | null): BoardLane {
-    if (question !== null) return "needs_you";
+    if (question !== null) return questionLane(question);
     if (FINISHED_TASK_STATUSES.has(task.status)) return "done";
-    if (task.status === "in_progress" || task.status === "in_review") {
-      return "in_progress";
-    }
+    if (task.status === "in_review") return "in_review";
+    if (task.status === "in_progress") return "in_progress";
     return "queue";
   }
 
@@ -1301,8 +1385,9 @@ export default async function plugin(bb: BbPluginApi) {
   const LANE_ORDER: Record<BoardLane, number> = {
     queue: 0,
     in_progress: 1,
-    needs_you: 2,
-    done: 3,
+    in_review: 2,
+    needs_you: 3,
+    done: 4,
   };
   const PRIORITY_ORDER: Record<(typeof PRIORITIES)[number], number> = {
     high: 0,
@@ -1380,6 +1465,8 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: pendingComments(row.id).length,
         workers: [],
         question,
+        pullRequests: [],
+        pullRequestsUnavailable: false,
         movable: true,
         dispatchOnAdvance: row.state === "queued",
       });
@@ -1421,6 +1508,8 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: 0,
         workers: [],
         question,
+        pullRequests: [],
+        pullRequestsUnavailable: false,
         movable: true,
         dispatchOnAdvance: false,
       });
@@ -1435,7 +1524,7 @@ export default async function plugin(bb: BbPluginApi) {
       cards.push({
         id: item.id,
         kind: "question",
-        lane: "needs_you",
+        lane: questionLane(item),
         title: item.task !== "" ? item.task : item.question,
         body: "",
         priority: item.urgent ? "high" : "normal",
@@ -1454,6 +1543,8 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: 0,
         workers: [],
         question: item,
+        pullRequests: [],
+        pullRequestsUnavailable: false,
         movable: false,
         dispatchOnAdvance: false,
       });
@@ -1476,12 +1567,18 @@ export default async function plugin(bb: BbPluginApi) {
       enrich.map(async (card) => {
         const taskId = card.taskId;
         if (taskId === null) return;
-        const [workers, comments] = await Promise.all([
+        const [workers, comments, pullRequests] = await Promise.all([
           taskWorkers(taskId),
           taskCommentCount(taskId),
+          // Only In review needs them, and each one costs a git-host round trip.
+          card.lane === "in_review"
+            ? taskPullRequests(taskId)
+            : Promise.resolve({ pullRequests: [], unavailable: false }),
         ]);
         card.workers = workers;
         card.commentCount += comments;
+        card.pullRequests = pullRequests.pullRequests;
+        card.pullRequestsUnavailable = pullRequests.unavailable;
       }),
     );
 
@@ -1544,6 +1641,11 @@ export default async function plugin(bb: BbPluginApi) {
         publish();
       } else if (lane === "done") {
         closeRequest(cardId, request.outcome, false);
+      } else if (lane === "in_review") {
+        db.prepare(
+          `UPDATE requests SET state = 'in_review', closed_at = NULL WHERE id = ?`,
+        ).run(cardId);
+        publish();
       } else if (lane === "in_progress" && request.state !== "in_flight") {
         db.prepare(`UPDATE requests SET state = 'dispatched' WHERE id = ?`).run(
           cardId,
@@ -2109,6 +2211,12 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb inbox ack <id> --task-key ABC-12",
       },
       {
+        name: "ready",
+        summary:
+          "Park a request in In review — finished, awaiting the Captain's sign-off",
+        usage: 'bb inbox ready <id> [--outcome "PR #412 is open"]',
+      },
+      {
         name: "close",
         summary: "Close a request with an outcome",
         usage: 'bb inbox close <id> [--outcome "…"] [--cancelled]',
@@ -2434,6 +2542,29 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 0, stdout: `Acked ${id} → ${taskKey}.` };
         }
 
+        case "ready": {
+          const id = parsed.positional[0];
+          if (id === undefined) {
+            return { exitCode: 1, stderr: "Usage: bb inbox ready <id>" };
+          }
+          const result = await moveCard(id, "in_review");
+          if (!result.ok) {
+            return { exitCode: 1, stderr: result.error ?? "Could not park it." };
+          }
+          const note = textFlag(parsed, "outcome");
+          if (note !== undefined) {
+            db.prepare(`UPDATE requests SET outcome = ? WHERE id = ?`).run(
+              note,
+              id,
+            );
+            publish();
+          }
+          return {
+            exitCode: 0,
+            stdout: `${id} is in review. The Captain closes it out.`,
+          };
+        }
+
         case "close": {
           const id = parsed.positional[0];
           if (id === undefined) {
@@ -2499,7 +2630,7 @@ export default async function plugin(bb: BbPluginApi) {
         default:
           return {
             exitCode: 1,
-            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, close, dispatch, voice-parse, chief`,
+            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, chief`,
           };
       }
     },

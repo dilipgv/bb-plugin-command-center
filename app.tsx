@@ -1,9 +1,10 @@
 /**
- * The command center panel: a composer over a four-lane board.
+ * The command center panel: a composer over a five-lane board.
  *
- * Queue → In progress → Done are yours to drag. Needs you is derived from open
- * questions, so it takes no drops — cards arrive when an agent asks something
- * and leave when you answer.
+ * Queue → In progress → In review → Done are yours to drag; the last step is
+ * deliberately manual, because signing work off is the Captain's call. Needs you
+ * is derived from open questions, so it takes no drops — cards arrive when an
+ * agent asks something and leave when you answer.
  *
  * Cards come from three places and are drawn identically: requests you queued,
  * tasks the org created without you, and bare questions. This is meant to be
@@ -761,6 +762,7 @@ function ItemCard({
 const LANE_TITLES: Record<BoardLane, string> = {
   queue: "Queue",
   in_progress: "In progress",
+  in_review: "In review",
   needs_you: "Needs you",
   done: "Done",
 };
@@ -768,12 +770,18 @@ const LANE_TITLES: Record<BoardLane, string> = {
 const LANES_ORDER: BoardLane[] = [
   "queue",
   "in_progress",
+  "in_review",
   "needs_you",
   "done",
 ];
 
 /** Needs you is derived from open questions, so nothing can be dropped there. */
-const DROPPABLE_LANES: BoardLane[] = ["queue", "in_progress", "done"];
+const DROPPABLE_LANES: BoardLane[] = [
+  "queue",
+  "in_progress",
+  "in_review",
+  "done",
+];
 
 const DRAG_MIME = "application/x-bb-inbox-card";
 
@@ -1069,6 +1077,17 @@ function BoardCardTile({
         {card.taskKey !== null ? <Chip tone="accent">{card.taskKey}</Chip> : null}
         {card.kind === "question" ? <Chip tone="urgent">question</Chip> : null}
         {card.commentCount > 0 ? <Chip>{card.commentCount} 💬</Chip> : null}
+        {card.pullRequests.map((pullRequest) => (
+          <Chip
+            key={pullRequest.url}
+            tone={pullRequest.state === "open" ? "accent" : "muted"}
+          >
+            PR #{pullRequest.number} {pullRequest.state}
+          </Chip>
+        ))}
+        {card.pullRequestsUnavailable && card.pullRequests.length === 0 ? (
+          <Chip>PR unknown</Chip>
+        ) : null}
         {card.workers.length > 0 ? (
           <Chip tone="accent">{card.workers.length} 🧵</Chip>
         ) : null}
@@ -1168,7 +1187,9 @@ function BoardColumn({
               ? "Nothing is waiting on you."
               : lane === "in_progress"
                 ? "Nothing in flight."
-                : "Nothing finished recently."}
+                : lane === "in_review"
+                  ? "Nothing waiting on your sign-off."
+                  : "Nothing finished recently."}
         </p>
       ) : (
         cards.map((card) => (

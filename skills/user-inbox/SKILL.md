@@ -139,12 +139,29 @@ keep the Captain's picture accurate — with two extra obligations:
    bb inbox ack cc_a1b2c3 --task-key ABC-12
    ```
 
-2. **Close it** when the work is finished or abandoned, with one line of outcome:
+2. **Park it for sign-off** when the work is done but a human should look — a PR
+   to review, a document to read, anything you should not call finished
+   yourself. The card moves to the board's **In review** lane and waits there:
+
+   ```sh
+   bb inbox ready cc_a1b2c3 --outcome "PR #412 is open"
+   ```
+
+   Setting the task's own status does the same thing, so
+   `bb tasks update <key> --status in_review` also lands the card in In review —
+   use whichever you already have to hand.
+
+3. **Close it** only when there is nothing to sign off: work that produced no
+   reviewable artefact, or that was abandoned.
 
    ```sh
    bb inbox close cc_a1b2c3 --outcome "Shipped in PR #412"
    bb inbox close cc_a1b2c3 --cancelled --outcome "Superseded by ABC-19"
    ```
+
+   **Prefer `ready` over `close` for anything reviewable.** Moving a card into
+   Done is the Captain's manual step; doing it for them removes their last look
+   at the work.
 
 Never silently drop a request: if it is not actionable, ask about it through
 `bb inbox ask` rather than leaving the card sitting in flight.
