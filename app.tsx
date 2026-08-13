@@ -16,13 +16,85 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { useVoiceCapture } from "@/hooks/useVoiceCapture";
 import type { InboxItem, InboxRequest, rpcContract } from "./server";
 
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 type Priority = InboxRequest["priority"];
+type VoiceCapture = ReturnType<typeof useVoiceCapture>;
 
 const PRIORITIES: Priority[] = ["low", "normal", "high"];
+
+interface VoiceAvailability {
+  enabled: boolean;
+  error: string | null;
+}
+
+/**
+ * The one control for every voice affordance: idle mic, live stop button, and
+ * a spinner while the clip is being transcribed.
+ */
+function MicButton({
+  capture,
+  availability,
+  label,
+}: {
+  capture: VoiceCapture;
+  availability: VoiceAvailability;
+  label: string;
+}) {
+  if (!capture.isSupported || !availability.enabled) return null;
+
+  const { isRecording, isTranscribing, toggle } = capture;
+  return (
+    <Button
+      size="sm"
+      variant={isRecording ? "destructive" : "ghost"}
+      disabled={isTranscribing}
+      aria-label={isRecording ? `Stop recording (${label})` : label}
+      aria-pressed={isRecording}
+      onClick={() => toggle()}
+    >
+      <Icon
+        name={isTranscribing ? "Spinner" : isRecording ? "Square" : "Mic"}
+        className={isTranscribing ? "animate-spin" : undefined}
+        aria-hidden="true"
+      />
+      {isRecording ? "Stop" : null}
+    </Button>
+  );
+}
+
+/** What the transcriber heard, so a mishearing is visible before it acts. */
+function HeardLine({
+  transcript,
+  understood,
+  hint,
+}: {
+  transcript: string;
+  understood?: string[];
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1 rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
+      <p className="text-xs italic text-muted-foreground">“{transcript}”</p>
+      {understood !== undefined && understood.length > 0 ? (
+        <div className="flex flex-wrap gap-1">
+          {understood.map((entry) => (
+            <Chip key={entry} tone="accent">
+              {entry}
+            </Chip>
+          ))}
+        </div>
+      ) : null}
+      {hint !== undefined ? (
+        <p className="text-[10px] text-muted-foreground">{hint}</p>
+      ) : null}
+    </div>
+  );
+}
 
 function relative(ms: number): string {
   const seconds = Math.round((Date.now() - ms) / 1000);
@@ -156,10 +228,12 @@ function Chip({
 function Composer({
   rpc,
   projects,
+  voice,
   onAdded,
 }: {
   rpc: Rpc;
   projects: { id: string; name: string }[];
+  voice: VoiceAvailability;
   onAdded: () => void;
 }) {
   const [title, setTitle] = React.useState("");
@@ -169,6 +243,54 @@ function Composer({
   const [priority, setPriority] = React.useState<Priority>("normal");
   const [urgent, setUrgent] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  const [heard, setHeard] = React.useState<{
+    transcript: string;
+    understood: string[];
+    intent: "queue" | "dispatch";
+  } | null>(null);
+
+  /**
+   * Voice fills the form; it never sends. A spoken "dispatch" is recorded as
+   * intent and highlights the button, because acting on a mishearing would put
+   * wrong work in front of Chief.
+   */
+  const capture = useVoiceCapture({
+    onClip: async (clip) => {
+      const result = await rpc.call("voiceCompose", {
+        audioBase64: clip.base64,
+        mimeType: clip.mimeType,
+        filename: clip.filename,
+      });
+      if (result.title !== "") setTitle(result.title);
+      if (result.body !== "") {
+        setBody(result.body);
+        setShowBody(true);
+      }
+      setPriority(result.priority);
+      setUrgent(result.urgent);
+      if (result.projectId !== null) setProjectId(result.projectId);
+      setHeard({
+        transcript: result.transcript,
+        understood: result.understood,
+        intent: result.intent,
+      });
+      if (result.title === "") {
+        toast.warning("Heard you, but could not find the task in that.");
+      }
+    },
+    onError: (message) => toast.error(message),
+  });
+
+  // Push to talk from anywhere in the panel, including while typing.
+  React.useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.altKey || event.code !== "KeyV" || event.repeat) return;
+      event.preventDefault();
+      capture.toggle();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [capture]);
 
   const submit = async (dispatchNow: boolean) => {
     const trimmed = title.trim();
@@ -193,6 +315,7 @@ function Composer({
       setBody("");
       setShowBody(false);
       setUrgent(false);
+      setHeard(null);
       onAdded();
     } catch (error) {
       toast.error(String(error));
@@ -203,17 +326,40 @@ function Composer({
 
   return (
     <div className="space-y-2 rounded-lg border border-border bg-card p-3">
-      <Input
-        autoFocus
-        value={title}
-        placeholder="What needs doing? Enter to queue, ⌘Enter to dispatch"
-        onChange={(event) => setTitle(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key !== "Enter") return;
-          event.preventDefault();
-          void submit(event.metaKey || event.ctrlKey);
-        }}
-      />
+      <div className="flex items-center gap-2">
+        <Input
+          autoFocus
+          value={title}
+          placeholder={
+            capture.isRecording
+              ? "Listening… say the work, then any of: urgent, high priority, in <project>, dispatch"
+              : "What needs doing? Enter to queue, ⌘Enter to dispatch"
+          }
+          onChange={(event) => setTitle(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter") return;
+            event.preventDefault();
+            void submit(event.metaKey || event.ctrlKey);
+          }}
+        />
+        <MicButton
+          capture={capture}
+          availability={voice}
+          label="Dictate a request (⌥V)"
+        />
+      </div>
+
+      {heard !== null ? (
+        <HeardLine
+          transcript={heard.transcript}
+          understood={heard.understood}
+          hint={
+            heard.intent === "dispatch"
+              ? "You said dispatch — review it, then press Dispatch."
+              : "Review it, then press Queue."
+          }
+        />
+      ) : null}
       {showBody ? (
         <textarea
           value={body}
@@ -274,6 +420,9 @@ function Composer({
           <Button
             size="sm"
             disabled={busy || title.trim() === ""}
+            className={
+              heard?.intent === "dispatch" ? "ring-2 ring-ring" : undefined
+            }
             onClick={() => void submit(true)}
           >
             Dispatch
@@ -289,15 +438,68 @@ function Composer({
 function ItemCard({
   item,
   rpc,
+  voice,
   onNavigate,
 }: {
   item: InboxItem;
   rpc: Rpc;
+  voice: VoiceAvailability;
   onNavigate: (threadId: string) => void;
 }) {
   const [text, setText] = React.useState("");
   const [checked, setChecked] = React.useState<string[]>([]);
   const [busy, setBusy] = React.useState(false);
+  const [heard, setHeard] = React.useState<{
+    transcript: string;
+    hint: string;
+  } | null>(null);
+  /** A spoken option waits for one confirming tap rather than self-sending. */
+  const [pendingOption, setPendingOption] = React.useState<string | null>(null);
+
+  const hasOptions = item.options.length > 0;
+  const takesText =
+    item.kind === "text" || item.kind === "review" || !hasOptions;
+
+  const capture = useVoiceCapture({
+    onClip: async (clip) => {
+      const result = await rpc.call("voiceAnswer", {
+        audioBase64: clip.base64,
+        mimeType: clip.mimeType,
+        filename: clip.filename,
+        itemId: item.id,
+      });
+
+      if (item.kind === "multi" && result.options.length > 0) {
+        setChecked(result.options);
+        setHeard({
+          transcript: result.transcript,
+          hint: `Selected ${result.options.length}. Press Send to confirm.`,
+        });
+        return;
+      }
+      if (hasOptions && result.option !== null) {
+        setPendingOption(result.option);
+        setHeard({
+          transcript: result.transcript,
+          hint: `Matched “${result.option}” — press it to confirm.`,
+        });
+        return;
+      }
+      if (takesText) {
+        setText(result.transcript);
+        setHeard({
+          transcript: result.transcript,
+          hint: "Press Send to answer.",
+        });
+        return;
+      }
+      setHeard({
+        transcript: result.transcript,
+        hint: "That did not match any option — pick one below.",
+      });
+    },
+    onError: (message) => toast.error(message),
+  });
 
   const resolve = async (answer: string) => {
     if (busy) return;
@@ -333,9 +535,18 @@ function ItemCard({
         <span className="ml-auto text-[10px] text-muted-foreground">
           {relative(item.createdAt)}
         </span>
+        <MicButton
+          capture={capture}
+          availability={voice}
+          label="Answer by voice"
+        />
       </div>
 
       <p className="text-sm text-foreground">{item.question}</p>
+
+      {heard !== null ? (
+        <HeardLine transcript={heard.transcript} hint={heard.hint} />
+      ) : null}
 
       {item.priorAnswer !== null ? (
         <p className="text-xs text-destructive">
@@ -370,7 +581,10 @@ function ItemCard({
             <Button
               key={option}
               size="sm"
-              variant="outline"
+              variant={pendingOption === option ? "default" : "outline"}
+              className={
+                pendingOption === option ? "ring-2 ring-ring" : undefined
+              }
               disabled={busy}
               onClick={() => void resolve(option)}
             >
@@ -628,12 +842,22 @@ function CommandCenter() {
     [],
   );
   const [showDone, setShowDone] = React.useState(false);
+  const [voice, setVoice] = React.useState<VoiceAvailability>({
+    enabled: false,
+    error: null,
+  });
 
   React.useEffect(() => {
     void rpc
       .call("projects")
       .then((result) => setProjects(result.projects))
       .catch(() => setProjects([]));
+    void rpc
+      .call("voiceStatus")
+      .then(setVoice)
+      .catch((error: unknown) =>
+        setVoice({ enabled: false, error: String(error) }),
+      );
   }, [rpc]);
 
   const openThread = React.useCallback(
@@ -654,11 +878,22 @@ function CommandCenter() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="mx-auto w-full max-w-3xl space-y-5 p-4 md:p-5">
-        <Composer rpc={rpc} projects={projects} onAdded={refresh} />
+        <Composer
+          rpc={rpc}
+          projects={projects}
+          voice={voice}
+          onAdded={refresh}
+        />
 
         {queue.chiefError !== null ? (
           <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
             {queue.chiefError}
+          </p>
+        ) : null}
+
+        {!voice.enabled && voice.error !== null ? (
+          <p className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+            {voice.error}
           </p>
         ) : null}
 
@@ -676,6 +911,7 @@ function CommandCenter() {
                   key={item.id}
                   item={item}
                   rpc={rpc}
+                  voice={voice}
                   onNavigate={openThread}
                 />
               ))}

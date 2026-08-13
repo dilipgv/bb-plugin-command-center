@@ -19,6 +19,13 @@ import {
 } from "@bb/plugin-sdk";
 import { z } from "zod";
 
+import {
+  matchSpokenOption,
+  matchSpokenOptions,
+  parseVoiceCommand,
+  type VoiceProject,
+} from "./lib/voice-command";
+
 // ---------------------------------------------------------------- shapes
 
 const ITEM_KINDS = ["options", "multi", "text", "ack", "review"] as const;
@@ -78,6 +85,20 @@ const requestDto = z.object({
 
 export type InboxItem = z.infer<typeof itemDto>;
 export type InboxRequest = z.infer<typeof requestDto>;
+
+/**
+ * An audio clip from the panel. Base64 because rpc carries strict JSON only;
+ * the filename travels all the way to the transcription backend, which infers
+ * the audio format from its extension.
+ */
+const voiceClipInput = z.object({
+  audioBase64: z.string().min(1),
+  mimeType: z.string().min(1),
+  filename: z.string().min(1),
+});
+
+/** ~6 MB of audio — far more than a spoken command, far under the 25 MB cap. */
+const MAX_AUDIO_BASE64_LENGTH = 8_000_000;
 
 export const rpcContract = defineRpcContract({
   list: {
@@ -173,6 +194,60 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({
       projects: z.array(z.object({ id: z.string(), name: z.string() })),
+    }),
+  },
+  voiceStatus: {
+    input: z.null(),
+    output: z.object({
+      enabled: z.boolean(),
+      error: z.string().nullable(),
+    }),
+  },
+  /** Dictation: audio in, text out. */
+  transcribe: {
+    input: voiceClipInput.extend({ prompt: z.string().optional() }).strict(),
+    output: z.object({ text: z.string() }),
+  },
+  /** A spoken command parsed into a request draft. Never dispatches by itself. */
+  voiceCompose: {
+    input: voiceClipInput.strict(),
+    output: z.object({
+      transcript: z.string(),
+      title: z.string(),
+      body: z.string(),
+      priority: z.enum(PRIORITIES),
+      urgent: z.boolean(),
+      projectId: z.string().nullable(),
+      projectName: z.string().nullable(),
+      intent: z.enum(["queue", "dispatch"]),
+      understood: z.array(z.string()),
+    }),
+  },
+  /** A spoken answer to one open question, matched against its options. */
+  voiceAnswer: {
+    input: voiceClipInput.extend({ itemId: z.string() }).strict(),
+    output: z.object({
+      transcript: z.string(),
+      /** Best single option, when one clearly wins. */
+      option: z.string().nullable(),
+      confidence: z.number(),
+      /** Every option mentioned, for multi-select questions. */
+      options: z.array(z.string()),
+    }),
+  },
+  /** Test phrasing without a microphone. Also powers `bb inbox voice-parse`. */
+  parseVoice: {
+    input: z.object({ transcript: z.string() }).strict(),
+    output: z.object({
+      transcript: z.string(),
+      title: z.string(),
+      body: z.string(),
+      priority: z.enum(PRIORITIES),
+      urgent: z.boolean(),
+      projectId: z.string().nullable(),
+      projectName: z.string().nullable(),
+      intent: z.enum(["queue", "dispatch"]),
+      understood: z.array(z.string()),
     }),
   },
 });
@@ -889,6 +964,75 @@ export default async function plugin(bb: BbPluginApi) {
     return true;
   }
 
+  // ---------------------------------------------------------------- voice
+
+  async function voiceProjects(): Promise<VoiceProject[]> {
+    try {
+      const projects = await bb.sdk.projects.list({ includePersonal: true });
+      return projects.map((project) => ({
+        id: project.id,
+        name: project.name,
+      }));
+    } catch (error) {
+      bb.log.debug(`voice: project list unavailable: ${String(error)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Transcription accepts a biasing prompt. Feeding it the vocabulary we expect
+   * — project names, command words — is what makes "in ecosystem" come back as
+   * the project rather than a homophone.
+   */
+  function composePrompt(projects: readonly VoiceProject[]): string {
+    const names = projects.map((project) => project.name).join(", ");
+    return [
+      "A spoken work request for a task queue.",
+      names !== "" ? `Known projects: ${names}.` : "",
+      "Common phrases: queue, dispatch, send to chief, urgent, high priority, low priority, details.",
+    ]
+      .filter((part) => part !== "")
+      .join(" ");
+  }
+
+  function answerPrompt(item: InboxItem): string {
+    return [
+      `A spoken answer to the question: ${item.question}`,
+      item.options.length > 0
+        ? `Expected answers: ${item.options.join(", ")}.`
+        : "",
+    ]
+      .filter((part) => part !== "")
+      .join(" ");
+  }
+
+  async function transcribe(
+    clip: { audioBase64: string; mimeType: string; filename: string },
+    prompt?: string,
+  ): Promise<string> {
+    if (clip.audioBase64.length > MAX_AUDIO_BASE64_LENGTH) {
+      throw new Error(
+        "That clip is too long to transcribe. Keep voice commands under a couple of minutes.",
+      );
+    }
+    const bytes = Buffer.from(clip.audioBase64, "base64");
+    if (bytes.length === 0) {
+      throw new Error("No audio was received.");
+    }
+    // A File (not a bare Blob) so the filename — and therefore the audio
+    // format — survives all the way to the transcription backend.
+    const file = new File([bytes], clip.filename, { type: clip.mimeType });
+    const result = await bb.sdk.system.transcribeVoice(
+      prompt === undefined ? { file } : { file, prompt },
+    );
+    const text = result.text.replace(/\s+/gu, " ").trim();
+    if (text === "") {
+      throw new Error("Nothing was transcribed. Try again, a little closer.");
+    }
+    bb.log.info(`transcribed ${bytes.length} bytes of ${clip.mimeType}`);
+    return text;
+  }
+
   // ------------------------------------------------------------------ rpc
 
   bb.rpc.register(rpcContract, {
@@ -976,6 +1120,67 @@ export default async function plugin(bb: BbPluginApi) {
           id: project.id,
           name: project.name,
         })),
+      };
+    },
+    async voiceStatus() {
+      try {
+        const config = await bb.sdk.system.config();
+        return {
+          enabled: config.voiceTranscriptionEnabled,
+          error: config.voiceTranscriptionEnabled
+            ? null
+            : "Voice transcription is not configured on this server. Set a transcription model (or OPENAI_API_KEY) to enable it.",
+        };
+      } catch (error) {
+        return { enabled: false, error: String(error) };
+      }
+    },
+    async transcribe(input) {
+      return { text: await transcribe(input, input.prompt) };
+    },
+    async voiceCompose(input) {
+      const projects = await voiceProjects();
+      const transcript = await transcribe(input, composePrompt(projects));
+      const parsed = parseVoiceCommand(transcript, projects);
+      return {
+        transcript: parsed.transcript,
+        title: parsed.title,
+        body: parsed.body,
+        priority: parsed.priority,
+        urgent: parsed.urgent,
+        projectId: parsed.projectId,
+        projectName: parsed.projectName,
+        intent: parsed.intent,
+        understood: parsed.understood,
+      };
+    },
+    async voiceAnswer(input) {
+      const row = getItem(input.itemId);
+      if (row === undefined) {
+        throw new Error(`No item ${input.itemId}.`);
+      }
+      const item = toItem(row);
+      const transcript = await transcribe(input, answerPrompt(item));
+      const best = matchSpokenOption(transcript, item.options);
+      return {
+        transcript,
+        option: best?.option ?? null,
+        confidence: best?.confidence ?? 0,
+        options: matchSpokenOptions(transcript, item.options),
+      };
+    },
+    async parseVoice({ transcript }) {
+      const parsed = parseVoiceCommand(transcript, await voiceProjects());
+      return {
+        transcript: parsed.transcript,
+        title: parsed.title,
+        body: parsed.body,
+        priority: parsed.priority,
+        urgent: parsed.urgent,
+        projectId: parsed.projectId,
+        projectName: parsed.projectName,
+        intent: parsed.intent,
+        understood: parsed.understood,
       };
     },
   });
@@ -1154,6 +1359,12 @@ export default async function plugin(bb: BbPluginApi) {
         name: "dispatch",
         summary: "Send a queued request to Chief (normally the Captain's call)",
         usage: "bb inbox dispatch <id>",
+      },
+      {
+        name: "voice-parse",
+        summary:
+          "Show how a spoken phrase parses into a request, without a microphone",
+        usage: 'bb inbox voice-parse "bump the SDK, high priority, dispatch" [--json]',
       },
     ],
     async run(argv, ctx) {
@@ -1486,10 +1697,35 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
 
+        case "voice-parse": {
+          const transcript = parsed.positional.join(" ").trim();
+          if (transcript === "") {
+            return {
+              exitCode: 1,
+              stderr: 'Usage: bb inbox voice-parse "<spoken phrase>"',
+            };
+          }
+          const result = parseVoiceCommand(transcript, await voiceProjects());
+          return {
+            exitCode: 0,
+            stdout: json
+              ? JSON.stringify(result)
+              : [
+                  `title:    ${result.title}`,
+                  result.body !== "" ? `detail:   ${result.body}` : "",
+                  `priority: ${result.priority}${result.urgent ? " (urgent)" : ""}`,
+                  `project:  ${result.projectName ?? "(let Chief pick)"}`,
+                  `intent:   ${result.intent}`,
+                ]
+                  .filter((line) => line !== "")
+                  .join("\n"),
+          };
+        }
+
         default:
           return {
             exitCode: 1,
-            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, close, dispatch`,
+            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, close, dispatch, voice-parse`,
           };
       }
     },
