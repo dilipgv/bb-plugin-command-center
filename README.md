@@ -45,6 +45,30 @@ named key (`space`, `enter`, `slash`, …). At least one modifier is required so
 binding cannot fire while you type. Matching is by physical key, so ⌥-combos
 work despite macOS emitting `∂`/`√` for them.
 
+## Notifications
+
+macOS banners when something needs you or a card moves. bb has no native OS
+notifications, so this plugin sends them itself.
+
+```
+bb inbox notify-test                                   # check the OS lets them through
+bb plugin config command-center set notify off         # off | important | all
+bb plugin config command-center set notifySound true
+```
+
+`important` (the default) notifies on a new question or review request, and when
+a card reaches **In review**, **Needs you** or **Done**. `all` adds every other
+lane change. Urgent questions always play a sound.
+
+Two deliberate choices. It runs in the **backend**, not the panel, because on
+macOS bb keeps running with its window closed — a frontend notifier would go
+quiet exactly when you are working elsewhere. And the first sweep after install
+only *records* state, so adopting an existing board does not fire a banner per
+card. More than four changes in one sweep collapse into a single summary.
+
+Sent via `osascript`, so macOS attributes them to **Script Editor** — if nothing
+appears, allow it under System Settings → Notifications.
+
 ## Voice
 
 Speak instead of typing. `⌥V` toggles the mic anywhere in the panel, or click

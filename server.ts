@@ -23,6 +23,7 @@ import {
   type BbPluginApi,
   type JsonValue,
 } from "@bb/plugin-sdk";
+import { execFile } from "node:child_process";
 import { z } from "zod";
 
 import { CHIEF_MIGRATIONS } from "./chief/migrations";
@@ -564,6 +565,17 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Shortcut: add detail to a request",
       default: "alt+d",
     },
+    notify: {
+      type: "select",
+      label: "macOS notifications",
+      options: ["off", "important", "all"],
+      default: "important",
+    },
+    notifySound: {
+      type: "boolean",
+      label: "Play a sound with notifications",
+      default: false,
+    },
   });
 
   const db = bb.storage.database();
@@ -631,6 +643,13 @@ export default async function plugin(bb: BbPluginApi) {
     // share one database, so its statements follow the Inbox's rather than
     // starting from index 0 in a file of their own.
     ...CHIEF_MIGRATIONS,
+    // What each card looked like when we last told the Captain about it.
+    `CREATE TABLE IF NOT EXISTS notify_state (
+       card_id TEXT PRIMARY KEY,
+       lane TEXT,
+       task_status TEXT,
+       notified_at INTEGER NOT NULL
+     )`,
   ]);
 
   function publish(): void {
@@ -734,6 +753,8 @@ export default async function plugin(bb: BbPluginApi) {
       input.urgent ? 1 : 0,
     );
     publish();
+    const row = getItem(id);
+    if (row !== undefined) void notifyQuestion(toItem(row));
     return id;
   }
 
@@ -882,6 +903,19 @@ export default async function plugin(bb: BbPluginApi) {
       delivering = false;
     }
   }
+
+  bb.background.service("notify-watch", {
+    async start(signal) {
+      while (!signal.aborted) {
+        try {
+          await sweepNotifications();
+        } catch (error) {
+          bb.log.error(`notification sweep failed: ${String(error)}`);
+        }
+        await sleep(20_000, signal);
+      }
+    },
+  });
 
   bb.background.service("deliver-answers", {
     async start(signal) {
@@ -1395,10 +1429,12 @@ export default async function plugin(bb: BbPluginApi) {
     low: 2,
   };
 
-  async function buildBoard(): Promise<{
-    cards: BoardCard[];
-    tasksError: string | null;
-  }> {
+  async function buildBoard(
+    options: { enrich?: boolean } = {},
+  ): Promise<{ cards: BoardCard[]; tasksError: string | null }> {
+    // The notification sweep only needs lanes, and enrichment costs a Tasks
+    // round trip per card plus a git-host call for anything in review.
+    const shouldEnrich = options.enrich !== false;
     const questions = openQuestionsByTaskKey();
     const requests = db
       .prepare<[], RequestRow>(`SELECT * FROM requests`)
@@ -1560,9 +1596,11 @@ export default async function plugin(bb: BbPluginApi) {
 
     // Enrich the cards a worker could plausibly be on. Each is an extra call
     // into Tasks, so cap it rather than melt a large board.
-    const enrich = cards
-      .filter((card) => card.taskId !== null && card.lane !== "done")
-      .slice(0, MAX_ENRICHED_CARDS);
+    const enrich = shouldEnrich
+      ? cards
+          .filter((card) => card.taskId !== null && card.lane !== "done")
+          .slice(0, MAX_ENRICHED_CARDS)
+      : [];
     await Promise.all(
       enrich.map(async (card) => {
         const taskId = card.taskId;
@@ -1583,6 +1621,165 @@ export default async function plugin(bb: BbPluginApi) {
     );
 
     return { cards, tasksError };
+  }
+
+  // ------------------------------------------------------------ notifying
+
+  /**
+   * A real macOS banner, via osascript.
+   *
+   * This lives in the backend rather than the panel because on macOS bb keeps
+   * running with its window closed — a frontend notifier would go quiet exactly
+   * when you are working in another app and most want to be told. Arguments are
+   * passed as argv, never interpolated into AppleScript, so a task title with a
+   * quote in it cannot break or inject.
+   */
+  async function notifyMac(
+    title: string,
+    subtitle: string,
+    body: string,
+    withSound: boolean,
+  ): Promise<void> {
+    if (process.platform !== "darwin") return;
+    const script = withSound
+      ? 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv) sound name "default"'
+      : "display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)";
+    await new Promise<void>((resolve) => {
+      execFile(
+        "osascript",
+        ["-e", "on run argv", "-e", script, "-e", "end run", "--", title, subtitle, body],
+        (error) => {
+          if (error) bb.log.warn(`notification failed: ${String(error)}`);
+          resolve();
+        },
+      );
+    });
+  }
+
+  const NOTIFY_TITLE = "Command Center";
+  /** Beyond this many changes in one sweep, send a single summary instead. */
+  const NOTIFY_BURST_LIMIT = 4;
+
+  async function notifySetting(): Promise<{
+    mode: "off" | "important" | "all";
+    sound: boolean;
+  }> {
+    const values = await settings.get();
+    const raw = values.notify;
+    const mode =
+      raw === "off" || raw === "important" || raw === "all" ? raw : "important";
+    return { mode, sound: values.notifySound };
+  }
+
+  function laneLabel(lane: BoardLane): string {
+    return lane === "in_progress"
+      ? "In progress"
+      : lane === "in_review"
+        ? "In review"
+        : lane === "needs_you"
+          ? "Needs you"
+          : lane === "done"
+            ? "Done"
+            : "Queue";
+  }
+
+  /** Tell the Captain about one open question the moment it is filed. */
+  async function notifyQuestion(item: InboxItem): Promise<void> {
+    const { mode, sound } = await notifySetting();
+    if (mode === "off") return;
+    db.prepare(
+      `INSERT INTO notify_state (card_id, lane, task_status, notified_at)
+       VALUES (?, 'needs_you', NULL, ?)
+       ON CONFLICT(card_id) DO UPDATE SET lane = 'needs_you', notified_at = excluded.notified_at`,
+    ).run(item.id, Date.now());
+    const who = item.askedBy !== null ? ` (${item.askedBy})` : "";
+    await notifyMac(
+      NOTIFY_TITLE,
+      `${item.urgent ? "Urgent — " : ""}${item.task !== "" ? item.task : "Needs you"}${who}`,
+      item.question,
+      sound || item.urgent,
+    );
+  }
+
+  /**
+   * Diff the board against what was last announced. Silent on the very first
+   * sweep: seeding a fresh install must not fire a banner per existing card.
+   */
+  async function sweepNotifications(): Promise<void> {
+    const { mode, sound } = await notifySetting();
+    if (mode === "off") return;
+
+    const seen = new Map<string, { lane: string | null; status: string | null }>();
+    for (const row of db
+      .prepare<[], { card_id: string; lane: string | null; task_status: string | null }>(
+        `SELECT card_id, lane, task_status FROM notify_state`,
+      )
+      .all()) {
+      seen.set(row.card_id, { lane: row.lane, status: row.task_status });
+    }
+    const isFirstSweep = seen.size === 0;
+
+    const { cards } = await buildBoard({ enrich: false });
+    const record = db.prepare(
+      `INSERT INTO notify_state (card_id, lane, task_status, notified_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(card_id) DO UPDATE
+         SET lane = excluded.lane,
+             task_status = excluded.task_status,
+             notified_at = excluded.notified_at`,
+    );
+
+    const announce: { subtitle: string; body: string; urgent: boolean }[] = [];
+    for (const card of cards) {
+      const previous = seen.get(card.id);
+      const unchanged =
+        previous !== undefined &&
+        previous.lane === card.lane &&
+        previous.status === card.taskStatus;
+      record.run(card.id, card.lane, card.taskStatus, Date.now());
+      if (unchanged || isFirstSweep) continue;
+      // A brand-new card in Queue is usually the Captain typing it; not news.
+      if (previous === undefined && card.lane === "queue") continue;
+
+      const worthIt =
+        mode === "all" ||
+        card.lane === "in_review" ||
+        card.lane === "needs_you" ||
+        card.lane === "done";
+      if (!worthIt) continue;
+
+      const label = card.taskKey !== null ? `${card.taskKey} · ` : "";
+      announce.push({
+        subtitle: `${label}${laneLabel(card.lane)}`,
+        body: card.title,
+        urgent: card.urgent,
+      });
+    }
+
+    // Cards this plugin no longer draws should not pin state forever.
+    const live = new Set(cards.map((card) => card.id));
+    for (const cardId of seen.keys()) {
+      if (!live.has(cardId)) {
+        db.prepare(`DELETE FROM notify_state WHERE card_id = ?`).run(cardId);
+      }
+    }
+
+    if (announce.length === 0) return;
+    if (announce.length > NOTIFY_BURST_LIMIT) {
+      await notifyMac(
+        NOTIFY_TITLE,
+        `${announce.length} cards moved`,
+        announce
+          .slice(0, 3)
+          .map((entry) => entry.subtitle)
+          .join(", ") + ", …",
+        sound,
+      );
+      return;
+    }
+    for (const entry of announce) {
+      await notifyMac(NOTIFY_TITLE, entry.subtitle, entry.body, sound || entry.urgent);
+    }
   }
 
   /** Push a lane change back onto the task board, best effort. */
@@ -2227,6 +2424,12 @@ export default async function plugin(bb: BbPluginApi) {
         usage: "bb inbox dispatch <id>",
       },
       {
+        name: "notify-test",
+        summary:
+          "Send a test macOS notification, to check the OS is letting them through",
+        usage: "bb inbox notify-test",
+      },
+      {
         name: "voice-parse",
         summary:
           "Show how a spoken phrase parses into a request, without a microphone",
@@ -2598,6 +2801,31 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
 
+        case "notify-test": {
+          const { mode, sound } = await notifySetting();
+          if (mode === "off") {
+            return {
+              exitCode: 1,
+              stderr:
+                'Notifications are off. Turn them on with `bb plugin config command-center set notify important`.',
+            };
+          }
+          await notifyMac(
+            NOTIFY_TITLE,
+            "Notification test",
+            "If you can see this, notifications are working.",
+            sound,
+          );
+          return {
+            exitCode: 0,
+            stdout: [
+              `Sent (mode: ${mode}${sound ? ", with sound" : ""}).`,
+              "If nothing appeared, macOS is blocking the sender: System Settings →",
+              "Notifications → Script Editor, and allow it.",
+            ].join("\n"),
+          };
+        }
+
         case "voice-parse": {
           const transcript = parsed.positional.join(" ").trim();
           if (transcript === "") {
@@ -2630,7 +2858,7 @@ export default async function plugin(bb: BbPluginApi) {
         default:
           return {
             exitCode: 1,
-            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, chief`,
+            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, notify-test, chief`,
           };
       }
     },
