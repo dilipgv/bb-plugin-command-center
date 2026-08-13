@@ -408,6 +408,18 @@ export default async function plugin(bb: BbPluginApi) {
       default: "",
     },
     defaultProject: { type: "project", label: "Default project for requests" },
+    // BB's keyboard settings only accept its own built-in commands, so the
+    // panel owns these and reads them from here.
+    voiceShortcut: {
+      type: "string",
+      label: "Shortcut: start/stop voice capture",
+      default: "alt+v",
+    },
+    detailShortcut: {
+      type: "string",
+      label: "Shortcut: add detail to a request",
+      default: "alt+d",
+    },
   });
 
   const db = bb.storage.database();

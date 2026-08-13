@@ -12,12 +12,14 @@ import {
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
+  useSettings,
 } from "@bb/plugin-sdk/app";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { useShortcut } from "@/hooks/useShortcut";
 import { useVoiceCapture } from "@/hooks/useVoiceCapture";
 import type { InboxItem, InboxRequest, rpcContract } from "./server";
 
@@ -30,6 +32,21 @@ const PRIORITIES: Priority[] = ["low", "normal", "high"];
 interface VoiceAvailability {
   enabled: boolean;
   error: string | null;
+}
+
+/** Shortcuts live in plugin settings, so a missing value falls back silently. */
+function stringSetting(
+  values: Record<string, string | boolean> | undefined,
+  key: string,
+  fallback: string,
+): string {
+  const value = values?.[key];
+  return typeof value === "string" && value.trim() !== "" ? value : fallback;
+}
+
+/** "Add detail (⌥D)" — only when the shortcut actually parsed. */
+function withShortcut(label: string, hint: string | null): string {
+  return hint === null ? label : `${label} (${hint})`;
 }
 
 /**
@@ -281,16 +298,36 @@ function Composer({
     onError: (message) => toast.error(message),
   });
 
-  // Push to talk from anywhere in the panel, including while typing.
-  React.useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (!event.altKey || event.code !== "KeyV" || event.repeat) return;
-      event.preventDefault();
-      capture.toggle();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [capture]);
+  const titleRef = React.useRef<HTMLInputElement | null>(null);
+  const bodyRef = React.useRef<HTMLTextAreaElement | null>(null);
+
+  const openDetail = React.useCallback(() => {
+    setShowBody(true);
+    // The textarea does not exist until after this render.
+    requestAnimationFrame(() => bodyRef.current?.focus());
+  }, []);
+
+  const toggleDetail = React.useCallback(() => {
+    setShowBody((current) => {
+      if (current) {
+        requestAnimationFrame(() => titleRef.current?.focus());
+        return false;
+      }
+      requestAnimationFrame(() => bodyRef.current?.focus());
+      return true;
+    });
+  }, []);
+
+  const { values: settings } = useSettings();
+  const voiceKeys = useShortcut(
+    stringSetting(settings, "voiceShortcut", "alt+v"),
+    capture.toggle,
+    voice.enabled && capture.isSupported,
+  );
+  const detailKeys = useShortcut(
+    stringSetting(settings, "detailShortcut", "alt+d"),
+    toggleDetail,
+  );
 
   const submit = async (dispatchNow: boolean) => {
     const trimmed = title.trim();
@@ -329,6 +366,7 @@ function Composer({
       <div className="flex items-center gap-2">
         <Input
           autoFocus
+          ref={titleRef}
           value={title}
           placeholder={
             capture.isRecording
@@ -339,13 +377,19 @@ function Composer({
           onKeyDown={(event) => {
             if (event.key !== "Enter") return;
             event.preventDefault();
+            // Shift+Enter is "there is more to say" everywhere else, so it
+            // opens the detail box rather than submitting.
+            if (event.shiftKey) {
+              openDetail();
+              return;
+            }
             void submit(event.metaKey || event.ctrlKey);
           }}
         />
         <MicButton
           capture={capture}
           availability={voice}
-          label="Dictate a request (⌥V)"
+          label={withShortcut("Dictate a request", voiceKeys.label)}
         />
       </div>
 
@@ -362,11 +406,24 @@ function Composer({
       ) : null}
       {showBody ? (
         <textarea
+          ref={bodyRef}
           value={body}
           placeholder="Context, constraints, links — anything Chief should route with."
           rows={3}
           className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           onChange={(event) => setBody(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              titleRef.current?.focus();
+              return;
+            }
+            // Enter is a newline here; only the modifier submits.
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              void submit(true);
+            }
+          }}
         />
       ) : null}
       <div className="flex flex-wrap items-center gap-2">
@@ -404,9 +461,19 @@ function Composer({
         <Button
           size="sm"
           variant="ghost"
-          onClick={() => setShowBody((current) => !current)}
+          aria-pressed={showBody}
+          aria-label={withShortcut(
+            showBody ? "Hide detail" : "Add detail",
+            detailKeys.label,
+          )}
+          onClick={toggleDetail}
         >
           {showBody ? "Hide detail" : "Add detail"}
+          {detailKeys.label !== null ? (
+            <span className="text-[10px] text-muted-foreground">
+              {detailKeys.label}
+            </span>
+          ) : null}
         </Button>
         <div className="ml-auto flex gap-2">
           <Button

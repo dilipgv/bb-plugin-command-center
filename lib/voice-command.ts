@@ -56,8 +56,97 @@ const LEAD_VERB =
 const LEAD_DISPATCH =
   /^(?:please\s+)?(?:dispatch|send to chief|send this to chief|hand to chief)\s+(?:a|an|the)?\s*(?:task|request|item)?\s*(?:to|for|that)?\s*[:,]?\s*/;
 
-/** An explicit marker that splits the title from its detail. */
-const BODY_MARKER = /\b(?:details?|context|notes?|background)\s*[:,]\s+/i;
+/**
+ * A marker that splits the title from its detail, WITH punctuation — which is
+ * how it arrives when the speaker pauses and the transcriber obliges.
+ */
+const BODY_MARKER = /\b(?:details?|context|notes?|background)\s*[:,-]\s+/iu;
+
+/**
+ * The same marker with no punctuation at all: dictation usually returns
+ * "look into the leak details only happens after a long session" flat, so
+ * requiring a colon meant the detail silently stayed in the title.
+ *
+ * Unpunctuated splitting is genuinely ambiguous ("update the notes page"), and
+ * a wrongly split title is worse than a detail the user moves by hand, so it
+ * takes two guards: the marker may not be preceded by a determiner or a word
+ * that makes it a noun phrase, and what follows must be long enough to be a
+ * clause rather than the rest of a phrase.
+ */
+const BARE_BODY_MARKER = /\b(details?|context|notes?|background)\s+/giu;
+const MIN_BARE_DETAIL_WORDS = 4;
+const NOUN_PHRASE_BEFORE = new Set([
+  "the",
+  "a",
+  "an",
+  "my",
+  "our",
+  "your",
+  "its",
+  "their",
+  "his",
+  "her",
+  "these",
+  "those",
+  "some",
+  "more",
+  "all",
+  "any",
+  "no",
+  "release",
+  "additional",
+  "further",
+  "extra",
+  "other",
+  "same",
+  "full",
+  "api",
+  "product",
+  "design",
+]);
+
+function wordCount(text: string): number {
+  const trimmed = text.trim();
+  return trimmed === "" ? 0 : trimmed.split(/\s+/u).length;
+}
+
+/** Split a title into title + detail, or return null to leave it alone. */
+function splitDetail(title: string): { title: string; body: string } | null {
+  const punctuated = BODY_MARKER.exec(title);
+  if (punctuated !== null && punctuated.index > 0) {
+    return {
+      title: title.slice(0, punctuated.index).trim(),
+      body: title.slice(punctuated.index + punctuated[0].length).trim(),
+    };
+  }
+
+  BARE_BODY_MARKER.lastIndex = 0;
+  for (
+    let match = BARE_BODY_MARKER.exec(title);
+    match !== null;
+    match = BARE_BODY_MARKER.exec(title)
+  ) {
+    const before = title.slice(0, match.index).trim();
+    const after = title.slice(match.index + match[0].length).trim();
+    if (before === "" || wordCount(after) < MIN_BARE_DETAIL_WORDS) continue;
+    const precedingWord = before
+      .replace(/[^\p{L}\p{N}\s]+$/u, "")
+      .split(/\s+/u)
+      .pop();
+    if (
+      precedingWord !== undefined &&
+      NOUN_PHRASE_BEFORE.has(precedingWord.toLowerCase())
+    ) {
+      continue;
+    }
+    return {
+      title: before.replace(/[\s,;.]+$/u, ""),
+      // "note that X" reads better as just X.
+      body: after.replace(/^that\s+/iu, ""),
+    };
+  }
+  return null;
+}
 
 const YES_WORDS = [
   "yes",
@@ -388,10 +477,10 @@ export function parseVoiceCommand(
   title = stripTrailingModifiers(title.trim(), accumulator, projects);
 
   let body = "";
-  const bodySplit = BODY_MARKER.exec(title);
-  if (bodySplit !== null && bodySplit.index > 0) {
-    body = title.slice(bodySplit.index + bodySplit[0].length).trim();
-    title = title.slice(0, bodySplit.index).trim();
+  const split = splitDetail(title);
+  if (split !== null) {
+    title = split.title;
+    body = split.body;
   }
 
   title = capitalizeFirst(title.replace(/[\s,;.]+$/u, "").trim());

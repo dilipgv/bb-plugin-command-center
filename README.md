@@ -11,6 +11,31 @@ one panel:
   routes it to the owning project chief, which creates the task and hands it to
   an architect. Requests are never dispatched automatically.
 
+## Shortcuts
+
+| Keys | Does |
+| --- | --- |
+| `⌥V` | Start / stop voice capture |
+| `⌥D` | Toggle the detail box and focus it |
+| `⇧Enter` | (in the title) open the detail box |
+| `Enter` | Queue the request |
+| `⌘Enter` | Dispatch to Chief (works from the detail box too) |
+| `Esc` | (in the detail box) back to the title |
+
+BB's keyboard settings only accept BB's own built-in commands, so a plugin
+cannot register there. The two plugin-owned shortcuts are settings instead:
+
+```
+bb plugin config inbox set detailShortcut "mod+shift+d"
+bb plugin config inbox set voiceShortcut "alt+space"
+```
+
+Accepted form is `modifier+…+key`, using `alt`/`opt`, `shift`, `ctrl`,
+`cmd`/`meta`, or `mod` (⌘ on Apple, Ctrl elsewhere), plus a letter, digit, or
+named key (`space`, `enter`, `slash`, …). At least one modifier is required so a
+binding cannot fire while you type. Matching is by physical key, so ⌥-combos
+work despite macOS emitting `∂`/`√` for them.
+
 ## Voice
 
 Speak instead of typing. `⌥V` toggles the mic anywhere in the panel, or click
@@ -31,7 +56,13 @@ A spoken request may carry its own metadata:
 Modifiers are recognised only at the edges of what you said, so
 "fix the urgent care banner" stays a title and does not become urgent.
 Recognised: `urgent`, `high/low priority`, `in <project>`, `dispatch` /
-`send to chief`, and `details:` to split a note off the title.
+`send to chief`.
+
+Saying `details`, `context`, `notes` or `background` splits everything after it
+into the detail box — with or without the punctuation dictation may not produce.
+Because an unpunctuated split is ambiguous, it only happens when what follows is
+a clause of its own (four words or more) and the marker is not part of a noun
+phrase, so "update the notes page for the new API" stays one title.
 
 On a question card the mic dictates a text answer, or matches what you said
 against the offered options — including `yep`/`nope` for yes/no, and several
