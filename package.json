@@ -1,0 +1,41 @@
+{
+  "name": "bb-plugin-inbox",
+  "version": "0.2.0",
+  "type": "module",
+  "engines": {
+    "bb": ">=0.37",
+    "bbPluginSdk": "^0.4.1"
+  },
+  "bb": {
+    "name": "Inbox",
+    "description": "Your command center: questions agents need you to answer, and the requests you queue for Chief.",
+    "branding": {
+      "icon": "Mail"
+    },
+    "server": "./server.ts",
+    "app": "./app.tsx",
+    "skills": [
+      "skills"
+    ]
+  },
+  "dependencies": {
+    "@hugeicons/core-free-icons": "^4.1.3",
+    "@hugeicons/react": "^1.1.6",
+    "@radix-ui/react-slot": "^1.3.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "tailwind-merge": "^3.4.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@radix-ui/react-dialog": "^1.1.19",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "better-sqlite3": "^12.0.0",
+    "hono": "^4.11.9",
+    "sonner": "^2.0.8",
+    "typescript": "^5.7.0",
+    "vaul": "^1.1.2"
+  }
+}
