@@ -13,6 +13,7 @@
  */
 import * as React from "react";
 import {
+  Markdown,
   definePluginApp,
   useBbNavigate,
   useRealtime,
@@ -130,6 +131,49 @@ function HeardLine({
       ) : null}
       {hint !== undefined ? (
         <p className="text-[10px] text-muted-foreground">{hint}</p>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * A comment body as bb renders chat messages — agents write real Markdown
+ * (headings, tables, code fences), and a 10,000-character plan shown as
+ * pre-wrapped text is unreadable, worse so on a phone.
+ *
+ * Long bodies collapse by default so a card with five comments stays scannable
+ * and you expand only the one you came for.
+ */
+function CommentBody({ body }: { body: string }) {
+  const isLong = body.length > 700 || body.split("\n").length > 12;
+  const [isExpanded, setExpanded] = React.useState(false);
+  const isCollapsed = isLong && !isExpanded;
+
+  return (
+    <div className="min-w-0 space-y-1">
+      <div
+        className={
+          isCollapsed ? "relative max-h-40 overflow-hidden" : undefined
+        }
+      >
+        {/* Wide tables and code fences scroll rather than stretch the card. */}
+        <div className="min-w-0 overflow-x-auto">
+          <Markdown content={body} />
+        </div>
+        {isCollapsed ? (
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-card to-transparent" />
+        ) : null}
+      </div>
+      {isLong ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setExpanded((current) => !current)}
+        >
+          {isExpanded
+            ? "Show less"
+            : `Show more · ${Math.max(1, Math.round(body.length / 1000))}k chars`}
+        </Button>
       ) : null}
     </div>
   );
@@ -876,7 +920,7 @@ function CardDetail({
   };
 
   return (
-    <DialogContent className="max-w-2xl">
+    <DialogContent className="max-w-3xl">
       <DialogHeader>
         <DialogTitle>{card.title}</DialogTitle>
         <DialogDescription>
@@ -891,15 +935,18 @@ function CardDetail({
         </DialogDescription>
       </DialogHeader>
 
-      <div className="max-h-[60vh] space-y-4 overflow-y-auto">
+      <div className="min-w-0 space-y-4 md:max-h-[70vh] md:overflow-y-auto">
         {card.body.trim() !== "" ? (
-          <p className="whitespace-pre-wrap text-sm text-muted-foreground">
-            {card.body}
-          </p>
+          <CommentBody body={card.body} />
         ) : null}
 
         {card.outcome !== null ? (
-          <p className="text-sm text-muted-foreground">{card.outcome}</p>
+          <section className="space-y-1">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Outcome
+            </h3>
+            <CommentBody body={card.outcome} />
+          </section>
         ) : null}
 
         {card.question !== null ? (
@@ -981,7 +1028,7 @@ function CardDetail({
                   key={comment.id}
                   className="space-y-1 rounded-md border border-border px-2 py-1.5"
                 >
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                     <span className="text-xs font-medium text-foreground">
                       {comment.authorName}
                     </span>
@@ -996,9 +1043,7 @@ function CardDetail({
                       {relative(Date.parse(comment.createdAt))}
                     </span>
                   </div>
-                  <p className="whitespace-pre-wrap text-sm text-foreground">
-                    {comment.body}
-                  </p>
+                  <CommentBody body={comment.body} />
                 </article>
               ))}
             </div>
