@@ -161,7 +161,7 @@ function CommentBody({ body }: { body: string }) {
           <Markdown content={body} />
         </div>
         {isCollapsed ? (
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-card to-transparent" />
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-background to-transparent" />
         ) : null}
       </div>
       {isLong ? (
@@ -920,7 +920,7 @@ function CardDetail({
   };
 
   return (
-    <DialogContent className="max-w-3xl">
+    <DialogContent className="min-h-0 max-w-3xl">
       <DialogHeader>
         <DialogTitle>{card.title}</DialogTitle>
         <DialogDescription>
