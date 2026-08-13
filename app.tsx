@@ -931,6 +931,33 @@ function CardDetail({
           <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Comments
           </h3>
+
+          <div className="flex gap-2">
+            <Input
+              autoFocus
+              value={draft}
+              placeholder={
+                canNotify
+                  ? "Add context — the worker gets it immediately"
+                  : "Add context — delivered once this has a task"
+              }
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+            />
+            <Button
+              size="sm"
+              disabled={busy || draft.trim() === ""}
+              onClick={() => void submit()}
+            >
+              Send
+            </Button>
+          </div>
+
           {!loaded ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : comments.length === 0 ? (
@@ -967,27 +994,6 @@ function CardDetail({
               ))}
             </div>
           )}
-
-          <div className="flex gap-2">
-            <Input
-              value={draft}
-              placeholder={
-                canNotify
-                  ? "Add context — the worker gets it immediately"
-                  : "Add context — delivered once this has a task"
-              }
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void submit();
-                }
-              }}
-            />
-            <Button size="sm" disabled={busy || draft.trim() === ""} onClick={() => void submit()}>
-              Send
-            </Button>
-          </div>
         </section>
       </div>
 
@@ -1119,7 +1125,9 @@ function BoardColumn({
   return (
     <section
       className={`flex flex-col gap-2 rounded-lg border p-2 ${
-        isCompact ? "w-full" : "w-72 shrink-0"
+        // Columns share the centred board evenly rather than sitting at a fixed
+        // width, so the four lanes stay balanced under the composer.
+        isCompact ? "w-full" : "min-w-0 flex-1 basis-0"
       } ${isOver ? "border-ring bg-state-hover" : "border-border/60"}`}
       onDragOver={(event) => {
         if (!droppable) return;
@@ -1289,6 +1297,9 @@ function CommandCenter() {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto px-4 pb-4 md:px-5 md:pb-5">
+        {/* Centred on the same axis as the composer, just given more room —
+            four lanes do not fit the composer's reading width. */}
+        <div className="mx-auto w-full max-w-6xl">
         {isLoading && board.cards.length === 0 ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : (
@@ -1339,6 +1350,7 @@ function CommandCenter() {
             ))}
           </section>
         ) : null}
+        </div>
       </div>
 
       <Dialog

@@ -1808,8 +1808,9 @@ export default async function plugin(bb: BbPluginApi) {
           });
         }
       }
+      // Newest first: the latest context is what you need when you open a card.
       comments.sort((left, right) =>
-        left.createdAt.localeCompare(right.createdAt),
+        right.createdAt.localeCompare(left.createdAt),
       );
       return { comments, canNotify: taskId !== null, error };
     },
