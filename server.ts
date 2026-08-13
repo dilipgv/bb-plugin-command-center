@@ -341,6 +341,14 @@ export const rpcContract = defineRpcContract({
       error: z.string().nullable(),
     }),
   },
+  /**
+   * The sidebar badge's number. Deliberately one cheap COUNT: the nav badge
+   * polls it, and the board's own rpc is far too heavy for that.
+   */
+  attention: {
+    input: z.null(),
+    output: z.object({ needsYou: z.number() }),
+  },
   voiceStatus: {
     input: z.null(),
     output: z.object({
@@ -607,7 +615,10 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE items ADD COLUMN review_thread_id TEXT`,
     `ALTER TABLE items ADD COLUMN review_url TEXT`,
     `ALTER TABLE items ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0`,
-    `CREATE INDEX IF NOT EXISTS items_urgent_created ON items (urgent, created_at DESC)`,
+    // Reconstruction placeholder: this slot was already recorded as applied on
+    // the live database, so the statement here never executes. The index is
+    // created for real at the end of the list instead.
+    `SELECT 1`,
     `ALTER TABLE items ADD COLUMN snoozed_until INTEGER`,
     `ALTER TABLE items ADD COLUMN prior_answer TEXT`,
     // 12+ are new. Append only.
@@ -650,6 +661,9 @@ export default async function plugin(bb: BbPluginApi) {
        task_status TEXT,
        notified_at INTEGER NOT NULL
      )`,
+    // The real creation of the index whose original slot was consumed by the
+    // pre-rebuild migration history — declared above, never run, so appended.
+    `CREATE INDEX IF NOT EXISTS items_urgent_created ON items (urgent, created_at DESC)`,
   ]);
 
   function publish(): void {
@@ -2177,6 +2191,16 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return { ok: false, notified: 0, pending: false, error: String(error) };
       }
+    },
+    attention() {
+      const row = db
+        .prepare<[number], { open: number }>(
+          `SELECT COUNT(*) AS open FROM items
+             WHERE status = 'open'
+               AND (snoozed_until IS NULL OR snoozed_until <= ?)`,
+        )
+        .get(Date.now());
+      return { needsYou: row?.open ?? 0 };
     },
     async voiceStatus() {
       try {

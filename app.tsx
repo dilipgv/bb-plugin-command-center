@@ -38,6 +38,7 @@ import { Input } from "@/components/ui/input";
 import { useShortcut } from "@/hooks/useShortcut";
 import { useVoiceCapture } from "@/hooks/useVoiceCapture";
 import { ChiefHeader, ChiefPanel } from "./chief/panel";
+import { mountNavBadge } from "./nav-badge";
 import type {
   BoardCard,
   BoardLane,
@@ -1113,7 +1114,7 @@ function BoardCardTile({
         className="w-full text-left"
         onClick={() => onOpen(card)}
       >
-        <p className="text-sm text-foreground">{card.title}</p>
+        <p className="line-clamp-3 text-sm text-foreground">{card.title}</p>
       </button>
 
       <div className="flex flex-wrap items-center gap-1">
@@ -1140,7 +1141,9 @@ function BoardCardTile({
 
       {question !== null ? (
         <div className="space-y-1.5 border-t border-border/60 pt-1.5">
-          <p className="text-xs text-muted-foreground">{question.question}</p>
+          <p className="line-clamp-4 text-xs text-muted-foreground">
+            {question.question}
+          </p>
           <div className="flex flex-wrap gap-1">
             {question.options.slice(0, 3).map((option) => (
               <Button
@@ -1505,6 +1508,13 @@ function CommandCenterHeader() {
 }
 
 export default definePluginApp((app) => {
+  // A badge on our own sidebar row. There is no slot for this, so it is page
+  // code; it runs while any bb window is open, not only while this panel is.
+  app.contentScripts.register({
+    id: "nav-badge",
+    mount: ({ signal }) => mountNavBadge({ signal }),
+  });
+
   app.slots.navPanel({
     id: "inbox",
     title: "Command Center",

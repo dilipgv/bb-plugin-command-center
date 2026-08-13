@@ -912,52 +912,52 @@ export async function registerChief(
         name: "status",
         summary:
           "Chief, every project chief, their task architects with live status, and everything waiting on the Captain.",
-        usage: "bb chief status [--project <proj-id>] [--json]",
+        usage: "bb inbox chief status [--project <proj-id>] [--json]",
       },
       {
         name: "start",
         summary:
           "Create the single global Chief thread (bootstrapped with the one-word Chief trigger) if it does not exist.",
-        usage: "bb chief start [--json]",
+        usage: "bb inbox chief start [--json]",
       },
       {
         name: "adopt",
         summary: "Register an existing thread as the global Chief.",
-        usage: "bb chief adopt --thread thr_abc",
+        usage: "bb inbox chief adopt --thread thr_abc",
       },
       {
         name: "project-chief",
         summary:
           "Stand up the project chief for a project with a charter. Chief's move; same as the chief_project_chief tool.",
         usage:
-          'bb chief project-chief --project proj_abc --charter "What this chief owns…" [--json]',
+          'bb inbox chief project-chief --project proj_abc --charter "What this chief owns…" [--json]',
       },
       {
         name: "adopt-project-chief",
         summary:
           "Register an existing thread as the project chief for its project, without spawning anything. The project-chief counterpart of `adopt`.",
         usage:
-          'bb chief adopt-project-chief --thread thr_abc [--charter "What this chief owns…"] [--json]',
+          'bb inbox chief adopt-project-chief --thread thr_abc [--charter "What this chief owns…"] [--json]',
       },
       {
         name: "handoff",
         summary:
           "Hand an existing BB task to a new task architect with a full brief. Same as the chief_handoff tool, for providers without native tools.",
         usage:
-          'bb chief handoff --task BBC-12 --title "Ship the nav" --mission "…" [--criteria "…"]... [--constraint "…"]... [--context "…"] [--workspace worktree|project-default] [--project <proj-id>] [--json]',
+          'bb inbox chief handoff --task BBC-12 --title "Ship the nav" --mission "…" [--criteria "…"]... [--constraint "…"]... [--context "…"] [--workspace worktree|project-default] [--project <proj-id>] [--json]',
       },
       {
         name: "retire",
         summary:
           "Mark an architect or project chief thread finished so it drops out of the active rail.",
-        usage: "bb chief retire <thread-id> [--undo]",
+        usage: "bb inbox chief retire <thread-id> [--undo]",
       },
       {
         name: "tidy",
         summary:
           "Hide subordinate threads from the sidebar tree (they stay in this panel, on their tasks, and openable by id). Defaults to everything this plugin registered; --parent sweeps any thread's children instead. --undo puts them back.",
         usage:
-          "bb chief tidy [--parent <thread-id>] [--recursive] [--undo] [--json]",
+          "bb inbox chief tidy [--parent <thread-id>] [--recursive] [--undo] [--json]",
       },
     ],
     // Explicitly typed: outside bb.cli.register there is no contextual type.
@@ -986,7 +986,7 @@ export async function registerChief(
             ? groups.filter((group) => group.projectId === scope)
             : groups;
           const lines = [
-            `Chief: ${chief ? `${chief.threadId} [${chief.status}]` : "not started (bb chief start)"}`,
+            `Chief: ${chief ? `${chief.threadId} [${chief.status}]` : "not started (bb inbox chief start)"}`,
           ];
           if (shown.length === 0) lines.push("Project chiefs: none");
           for (const group of shown) {
@@ -1215,7 +1215,7 @@ export async function registerChief(
               ? "Nothing to tidy.\n"
               : `${visibility === "hidden" ? "Hid" : "Restored"} ${changed.length} of ${targets.length} thread(s).` +
                   (failed.length > 0 ? ` ${failed.length} failed.` : "") +
-                  `\nUndo: bb chief tidy${undoParent}${recursive ? " --recursive" : ""} --undo\n`,
+                  `\nUndo: bb inbox chief tidy${undoParent}${recursive ? " --recursive" : ""} --undo\n`,
             { visibility, changed, failed },
           );
         }

@@ -45,6 +45,20 @@ named key (`space`, `enter`, `slash`, …). At least one modifier is required so
 binding cannot fire while you type. Matching is by physical key, so ⌥-combos
 work despite macOS emitting `∂`/`√` for them.
 
+## Sidebar badge
+
+The Command Center row in the app sidebar carries a count of what is waiting on
+you. BB has no API for this — `navPanel` takes no badge and the host renders
+plugin rows without one — so `nav-badge.ts` is a **content script**: page code
+that finds the row and appends a span. It runs while any bb window is open, not
+only while the panel is in view.
+
+Two consequences are handled in that file rather than assumed away: the row is
+React-owned, so every poll re-asserts the badge instead of trusting it survived a
+re-render; and matching the row by its label has to strip a trailing number,
+because otherwise our own digits stop it matching next time. It reads one cheap
+`attention` rpc (a single `COUNT`), never the board.
+
 ## Notifications
 
 macOS banners when something needs you or a card moves. bb has no native OS
@@ -143,6 +157,11 @@ The Chief panel keeps its own nav entry: the board is the work, that panel is wh
 is doing it.
 
 ## Data
+
+> `~/.bb/plugins/inbox/` is **not live**. It is the pre-merge database from when
+> this plugin's id was `inbox`, left in place as a backup after the rename. The
+> live data is `~/.bb/plugins/command-center/data.db`. Delete the old directory
+> once you are confident nothing is missing.
 
 `items` (questions), `requests` (the command center lane) and Chief's own
 `chief`/`project_chiefs`/`architects` tables share one SQLite at

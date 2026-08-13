@@ -374,7 +374,9 @@ function ChiefPanel({ subPath }: { subPath: string }) {
                   <span className="block truncate font-medium text-foreground">
                     {item.taskKey ?? item.task}
                   </span>
-                  <span className="mt-0.5 block line-clamp-2 text-muted-foreground">
+                  {/* No `block` here: it beats line-clamp's display:-webkit-box, which
+    left a 2,000-character question rendering 896px tall. */}
+                  <span className="mt-0.5 line-clamp-2 text-muted-foreground">
                     {item.question}
                   </span>
                   <span className="mt-1 block text-[10px] text-muted-foreground">
