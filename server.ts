@@ -1,16 +1,21 @@
 /**
- * Inbox — the Captain's command center.
+ * Command Center — the Captain's only surface, and the org behind it.
  *
- * Two lanes, opposite directions, one panel:
+ * Two lanes, opposite directions, one board:
  *
  *   items    agent → you. A question, review request or FYI. The answer is
  *            delivered back into the asking thread durably.
  *   requests you → the org. Work you queue and then dispatch to Chief, which
  *            demuxes it to the owning project chief and its architects.
  *
- * The `items` schema predates this rebuild; the first twelve migrations
- * reconstruct it exactly so an existing data.db is adopted untouched. Append
- * new migrations only at the end.
+ * Chief itself lives in ./chief, merged in from the standalone chief-nav plugin.
+ * It owns its own rpc, settings, tools and panel; this module owns the one
+ * database (both halves share it), the one CLI command, and the dispatch path
+ * between the queue and Chief's thread.
+ *
+ * The `items` schema predates the rebuild; migrations 0–11 reconstruct it
+ * exactly so an existing data.db is adopted untouched. Append only at the end —
+ * Chief's tables sit after the Inbox's for exactly that reason.
  */
 import {
   defineRpcContract,
@@ -20,6 +25,8 @@ import {
 } from "@bb/plugin-sdk";
 import { z } from "zod";
 
+import { CHIEF_MIGRATIONS } from "./chief/migrations";
+import { registerChief, type ChiefNavNeedsInput } from "./chief/server";
 import {
   matchSpokenOption,
   matchSpokenOptions,
@@ -596,11 +603,32 @@ export default async function plugin(bb: BbPluginApi) {
        delivered_task_id TEXT
      )`,
     `CREATE INDEX IF NOT EXISTS request_comments_request ON request_comments (request_id, created_at)`,
+    // Chief's tables, appended when the two plugins merged. Both halves now
+    // share one database, so its statements follow the Inbox's rather than
+    // starting from index 0 in a file of their own.
+    ...CHIEF_MIGRATIONS,
   ]);
 
   function publish(): void {
     bb.realtime.publish("changed", { at: Date.now() });
   }
+
+  // Chief registers its own rpc, settings, tools, events and panel against the
+  // shared database. It used to read the Inbox over cross-plugin rpc; now that
+  // both halves are one plugin, it just gets a function.
+  const chief = await registerChief(bb, db, {
+    openQuestions: (): ChiefNavNeedsInput[] =>
+      listItems().open.map((item) => ({
+        id: item.id,
+        question: item.question,
+        task: item.task,
+        taskKey: item.taskKey,
+        askedBy: item.askedBy,
+        urgent: item.urgent,
+        reviewThreadId: item.reviewThreadId,
+        askerThreadId: item.threadId,
+      })),
+  });
 
   // ------------------------------------------------------------ item reads
 
@@ -968,29 +996,17 @@ export default async function plugin(bb: BbPluginApi) {
     status: string | null;
     error: string | null;
   }> {
-    try {
-      const state = await bb.sdk.plugins.callRpc({
-        pluginId: "chief-nav",
-        method: "state",
-        input: null,
-        outputSchema: z.looseObject({
-          chief: z
-            .looseObject({
-              threadId: z.string(),
-              status: z.string().nullish(),
-            })
-            .nullable(),
-        }),
-      });
-      if (state.chief?.threadId !== undefined) {
-        return {
-          threadId: state.chief.threadId,
-          status: state.chief.status ?? null,
-          error: null,
-        };
+    // Chief's own registry, read in-process. The setting stays as an override
+    // for a Chief thread that was started outside this plugin.
+    const registered = chief.chiefThreadId();
+    if (registered !== null) {
+      let status: string | null = null;
+      try {
+        status = (await bb.sdk.threads.get({ threadId: registered })).status;
+      } catch {
+        status = null;
       }
-    } catch (error) {
-      bb.log.debug(`chief-nav unavailable: ${String(error)}`);
+      return { threadId: registered, status, error: null };
     }
     const configured = (await settings.get()).chiefThreadId.trim();
     if (configured !== "") {
@@ -2031,7 +2047,8 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.cli.register({
     name: "inbox",
-    summary: "Your command center: ask the user, and pick up what they queued",
+    summary:
+      "Your command center: the queue, the questions, and the Chief org behind them",
     commands: [
       {
         name: "ask",
@@ -2106,6 +2123,18 @@ export default async function plugin(bb: BbPluginApi) {
         summary:
           "Show how a spoken phrase parses into a request, without a microphone",
         usage: 'bb inbox voice-parse "bump the SDK, high priority, dispatch" [--json]',
+      },
+      // Chief's whole surface under one entry: a plugin gets a single CLI
+      // command, and these names must be single tokens. Derived from Chief's
+      // own list so it cannot drift.
+      {
+        name: "chief",
+        summary: `The Chief org — ${chief.cli.commands
+          .map((command) => command.name)
+          .join(", ")}`,
+        usage: `bb inbox chief <${chief.cli.commands
+          .map((command) => command.name)
+          .join("|")}> [options]`,
       },
     ],
     async run(argv, ctx) {
@@ -2463,14 +2492,18 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
 
+        // Everything Chief used to answer as `bb chief …`.
+        case "chief":
+          return await chief.cli.run(rest, ctx);
+
         default:
           return {
             exitCode: 1,
-            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, close, dispatch, voice-parse`,
+            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, close, dispatch, voice-parse, chief`,
           };
       }
     },
   });
 
-  bb.log.info("inbox ready");
+  bb.log.info("command center ready");
 }

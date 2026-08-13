@@ -1,7 +1,9 @@
-# bb-plugin-inbox
+# bb-plugin-command-center
 
-The Captain's command center. Two lanes running in opposite directions through
-one panel:
+The Captain's command center, and the Chief org behind it — one plugin, merged
+from the former `inbox` and `chief-nav`.
+
+Two lanes run in opposite directions through the board:
 
 - **Needs you** — questions, review requests and FYIs that agents raised with
   `bb inbox ask` / `bb inbox review`. Answers are delivered back into the asking
@@ -26,8 +28,8 @@ BB's keyboard settings only accept BB's own built-in commands, so a plugin
 cannot register there. The two plugin-owned shortcuts are settings instead:
 
 ```
-bb plugin config inbox set detailShortcut "mod+shift+d"
-bb plugin config inbox set voiceShortcut "alt+space"
+bb plugin config command-center set detailShortcut "mod+shift+d"
+bb plugin config command-center set voiceShortcut "alt+space"
 ```
 
 Accepted form is `modifier+…+key`, using `alt`/`opt`, `shift`, `ctrl`,
@@ -97,31 +99,57 @@ bb inbox close <id> --outcome "Shipped in PR #412"
 
 Agents get the same surface through the bundled `user-inbox` skill.
 
+## Chief
+
+`bb inbox chief …` is Chief's whole surface (`status`, `start`, `adopt`,
+`project-chief`, `adopt-project-chief`, `handoff`, `retire`, `tidy`). It lives
+under `bb inbox` because **a plugin may register only one top-level CLI
+command** — merging cost `bb chief` as a name, not as a capability. The agent
+tools (`chief_project_chief`, `chief_handoff`, `chief_roster`) and the three
+Chief skills are unchanged.
+
+The Chief panel keeps its own nav entry: the board is the work, that panel is who
+is doing it.
+
 ## Data
 
-`items` (questions) and `requests` (the command center lane) live in this
-plugin's own SQLite at `<dataDir>/plugins/inbox/data.db`. The first twelve
-migrations reconstruct the `items` schema exactly as it shipped before this
-rebuild, so an existing database is adopted untouched — **append new migrations
-only at the end, never edit a shipped one.**
+`items` (questions), `requests` (the command center lane) and Chief's own
+`chief`/`project_chiefs`/`architects` tables share one SQLite at
+`<dataDir>/plugins/command-center/data.db`. The first twelve
+migrations reconstruct the `items` schema exactly as it shipped before the
+rebuild, and Chief's eight follow at 17–24 because both halves now share one
+file — **append new migrations only at the end, never edit or reorder a shipped
+one.**
 
-## Integration with Chief
+## Layout
 
-`chief-nav` owns the Chief org. This plugin asks it where Chief lives
-(`state` rpc) and falls back to the `chiefThreadId` setting, and chief-nav reads
-this plugin's `list` rpc for its "waiting on the Captain" rail. Each tolerates
-the other being absent; the `list` output shape is a contract — add fields, never
-rename them.
+- `server.ts` / `app.tsx` — the command center: board, queue, questions, voice.
+- `chief/` — the Chief org, merged in from `chief-nav`. It registers its own rpc,
+  settings, agent tools, events and panel; the host module owns the shared
+  database, the single CLI, and dispatching a request into Chief's thread.
+- `lib/`, `hooks/` — pure logic (voice grammar, shortcut parsing) and React
+  hooks, both unit-testable without a server.
+
+The two halves used to talk over cross-plugin rpc. They are now direct calls:
+Chief's needs-input rail reads the Inbox's open items through a callback, and the
+dispatcher reads Chief's thread from its own table.
+
+## Tasks
+
+The Tasks plugin stays the durable substrate — it owns task keys (which Chief's
+handoff contract requires), delivers comments to whoever is working a task, and
+outlives the threads. You should never have to open it: every card mirrors what
+it holds.
 
 ## Develop
 
 ```
 bb plugin install .          # register this directory
-bb plugin reload inbox       # after editing
+bb plugin reload command-center       # after editing
 bb plugin dev                # watch: rebuild + reload on save
 npx tsc --noEmit             # typecheck
 bb plugin types              # refresh types/ from the running BB
-bb plugin logs inbox -f
+bb plugin logs command-center -f
 ```
 
 `components/ui/` is vendored shadcn source you own; add more with

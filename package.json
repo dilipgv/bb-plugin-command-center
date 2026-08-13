@@ -1,16 +1,16 @@
 {
-  "name": "bb-plugin-inbox",
-  "version": "0.2.0",
+  "name": "bb-plugin-command-center",
+  "version": "0.3.0",
   "type": "module",
   "engines": {
     "bb": ">=0.37",
     "bbPluginSdk": "^0.4.1"
   },
   "bb": {
-    "name": "Inbox",
-    "description": "Your command center: questions agents need you to answer, and the requests you queue for Chief.",
+    "name": "Command Center",
+    "description": "The Captain's single surface: a board of everything in flight, the questions waiting on you, and the Chief org that works the queue.",
     "branding": {
-      "icon": "Mail"
+      "icon": "Crown"
     },
     "server": "./server.ts",
     "app": "./app.tsx",

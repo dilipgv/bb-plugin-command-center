@@ -35,6 +35,7 @@ import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { useShortcut } from "@/hooks/useShortcut";
 import { useVoiceCapture } from "@/hooks/useVoiceCapture";
+import { ChiefHeader, ChiefPanel } from "./chief/panel";
 import type {
   BoardCard,
   BoardLane,
@@ -1440,10 +1441,20 @@ function CommandCenterHeader() {
 export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "inbox",
-    title: "Inbox",
+    title: "Command Center",
     icon: "Mail",
     path: "inbox",
     component: CommandCenter,
     headerContent: CommandCenterHeader,
+  });
+  // Chief's org map keeps its own entry: the board is the work, this is who is
+  // working it. One plugin, two jobs.
+  app.slots.navPanel({
+    id: "chief",
+    title: "Chief",
+    icon: "Crown",
+    path: "chief",
+    component: ChiefPanel,
+    headerContent: ChiefHeader,
   });
 });
