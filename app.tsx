@@ -1,9 +1,14 @@
 /**
- * The command center panel.
+ * The command center panel: a composer over a four-lane board.
  *
- * Top: a composer that queues a request in one keystroke.
- * Then three lanes: questions waiting on you, the request queue you dispatch
- * to Chief, and what is currently in flight beneath it.
+ * Queue → In progress → Done are yours to drag. Needs you is derived from open
+ * questions, so it takes no drops — cards arrive when an agent asks something
+ * and leave when you answer.
+ *
+ * Cards come from three places and are drawn identically: requests you queued,
+ * tasks the org created without you, and bare questions. This is meant to be
+ * the only surface you look at, so anything a card needs — workers, comments,
+ * the question itself — opens here rather than sending you to another panel.
  */
 import * as React from "react";
 import {
@@ -17,11 +22,26 @@ import {
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { useIsCompactViewport } from "@/components/ui/hooks/use-compact-viewport";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { useShortcut } from "@/hooks/useShortcut";
 import { useVoiceCapture } from "@/hooks/useVoiceCapture";
-import type { InboxItem, InboxRequest, rpcContract } from "./server";
+import type {
+  BoardCard,
+  BoardLane,
+  InboxItem,
+  InboxRequest,
+  rpcContract,
+} from "./server";
 
 type Rpc = ReturnType<typeof useRpc<typeof rpcContract>>;
 type Priority = InboxRequest["priority"];
@@ -132,34 +152,34 @@ function untilLabel(ms: number): string {
   return `in ${Math.round(hours / 24)}d`;
 }
 
-/** One shared read of both lanes, refetched whenever the backend signals. */
+/** One shared read of the board plus the question queue behind it. */
 function useCommandCenter(rpc: Rpc) {
   const [items, setItems] = React.useState<{
     open: InboxItem[];
     snoozed: InboxItem[];
     resolved: InboxItem[];
   }>({ open: [], snoozed: [], resolved: [] });
-  const [queue, setQueue] = React.useState<{
-    requests: InboxRequest[];
+  const [board, setBoard] = React.useState<{
+    cards: BoardCard[];
     chiefThreadId: string | null;
-    chiefStatus: string | null;
     chiefError: string | null;
+    tasksError: string | null;
   }>({
-    requests: [],
+    cards: [],
     chiefThreadId: null,
-    chiefStatus: null,
     chiefError: null,
+    tasksError: null,
   });
   const [isLoading, setLoading] = React.useState(true);
 
   const refresh = React.useCallback(async () => {
     try {
-      const [nextItems, nextQueue] = await Promise.all([
+      const [nextItems, nextBoard] = await Promise.all([
         rpc.call("list"),
-        rpc.call("queue"),
+        rpc.call("board"),
       ]);
       setItems(nextItems);
-      setQueue(nextQueue);
+      setBoard(nextBoard);
     } catch (error) {
       toast.error(`Inbox failed to load: ${String(error)}`);
     } finally {
@@ -188,35 +208,10 @@ function useCommandCenter(rpc: Rpc) {
     if (connection === "connected") wasConnected.current = true;
   }, [connection, refresh]);
 
-  return { items, queue, isLoading, refresh };
+  return { items, board, isLoading, refresh };
 }
 
 // ------------------------------------------------------------------ chrome
-
-function Lane({
-  title,
-  count,
-  children,
-  action,
-}: {
-  title: string;
-  count: number;
-  children: React.ReactNode;
-  action?: React.ReactNode;
-}) {
-  return (
-    <section className="space-y-2">
-      <header className="flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          {title}
-        </h2>
-        <span className="text-xs text-muted-foreground">{count}</span>
-        <div className="ml-auto">{action}</div>
-      </header>
-      {children}
-    </section>
-  );
-}
 
 function Chip({
   children,
@@ -760,142 +755,424 @@ function ItemCard({
   );
 }
 
-// ---------------------------------------------------------------- requests
+// ------------------------------------------------------------------- board
 
-function RequestRow({
-  request,
+const LANE_TITLES: Record<BoardLane, string> = {
+  queue: "Queue",
+  in_progress: "In progress",
+  needs_you: "Needs you",
+  done: "Done",
+};
+
+const LANES_ORDER: BoardLane[] = [
+  "queue",
+  "in_progress",
+  "needs_you",
+  "done",
+];
+
+/** Needs you is derived from open questions, so nothing can be dropped there. */
+const DROPPABLE_LANES: BoardLane[] = ["queue", "in_progress", "done"];
+
+const DRAG_MIME = "application/x-bb-inbox-card";
+
+function workerTone(liveStatus: string | null): string {
+  switch (liveStatus) {
+    case "active":
+    case "starting":
+      return "text-foreground";
+    case "error":
+      return "text-destructive";
+    default:
+      return "text-muted-foreground";
+  }
+}
+
+/** Comments and context for one card, including answering its question. */
+function CardDetail({
+  card,
   rpc,
+  voice,
+  onClose,
   onNavigate,
+  onMove,
 }: {
-  request: InboxRequest;
+  card: BoardCard;
   rpc: Rpc;
+  voice: VoiceAvailability;
+  onClose: () => void;
   onNavigate: (threadId: string) => void;
+  onMove: (card: BoardCard, lane: BoardLane) => void;
 }) {
+  const [comments, setComments] = React.useState<
+    {
+      id: string;
+      body: string;
+      authorName: string;
+      kind: string;
+      threadId: string | null;
+      threadTitle: string | null;
+      createdAt: string;
+      notifiedCount: number;
+      pending: boolean;
+    }[]
+  >([]);
+  const [canNotify, setCanNotify] = React.useState(false);
+  const [draft, setDraft] = React.useState("");
   const [busy, setBusy] = React.useState(false);
-  const isQueued = request.state === "queued";
-  const isClosed = request.state === "done" || request.state === "cancelled";
+  const [loaded, setLoaded] = React.useState(false);
 
-  const dispatch = async () => {
-    setBusy(true);
+  const load = React.useCallback(async () => {
     try {
-      const result = await rpc.call("dispatchRequest", { id: request.id });
-      if (result.ok) toast.success("Dispatched to Chief");
-      else toast.error(result.error ?? "Dispatch failed");
+      const result = await rpc.call("cardComments", { cardId: card.id });
+      setComments(result.comments);
+      setCanNotify(result.canNotify);
+      if (result.error !== null) toast.error(result.error);
     } catch (error) {
       toast.error(String(error));
+    } finally {
+      setLoaded(true);
+    }
+  }, [card.id, rpc]);
+
+  React.useEffect(() => {
+    void load();
+  }, [load]);
+
+  const submit = async () => {
+    const body = draft.trim();
+    if (body === "" || busy) return;
+    setBusy(true);
+    try {
+      const result = await rpc.call("addCardComment", {
+        cardId: card.id,
+        body,
+      });
+      if (!result.ok) {
+        toast.error(result.error ?? "Comment failed");
+        return;
+      }
+      setDraft("");
+      toast.success(
+        result.pending
+          ? "Saved — it reaches the worker once Chief creates the task."
+          : result.notified > 0
+            ? `Sent to ${result.notified} working thread${result.notified === 1 ? "" : "s"}.`
+            : "Added to the task.",
+      );
+      await load();
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <article className="space-y-1.5 rounded-lg border border-border bg-card p-3">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {request.urgent ? <Chip tone="urgent">urgent</Chip> : null}
-        {request.priority !== "normal" ? <Chip>{request.priority}</Chip> : null}
-        {!isQueued ? <Chip tone="accent">{request.state}</Chip> : null}
-        {request.taskKey !== null ? <Chip tone="accent">{request.taskKey}</Chip> : null}
-        {request.blockedBy !== null ? <Chip tone="urgent">blocked</Chip> : null}
-        <span className="ml-auto text-[10px] text-muted-foreground">
-          {relative(request.createdAt)}
-        </span>
-      </div>
+    <DialogContent className="max-w-2xl">
+      <DialogHeader>
+        <DialogTitle>{card.title}</DialogTitle>
+        <DialogDescription>
+          {[
+            card.taskKey,
+            card.projectName,
+            card.taskStatus,
+            LANE_TITLES[card.lane],
+          ]
+            .filter((part): part is string => part !== null && part !== "")
+            .join(" · ")}
+        </DialogDescription>
+      </DialogHeader>
 
-      <p
-        className={`text-sm ${isClosed ? "text-muted-foreground line-through" : "text-foreground"}`}
-      >
-        {request.title}
-      </p>
-      {request.body.trim() !== "" ? (
-        <p className="whitespace-pre-wrap text-xs text-muted-foreground">
-          {request.body}
-        </p>
-      ) : null}
-      {request.outcome !== null ? (
-        <p className="text-xs text-muted-foreground">{request.outcome}</p>
-      ) : null}
-
-      <div className="flex flex-wrap items-center gap-1">
-        {isQueued ? (
-          <>
-            <Button
-              size="sm"
-              variant="ghost"
-              aria-label="Move up"
-              onClick={() =>
-                void rpc.call("moveRequest", { id: request.id, direction: "up" })
-              }
-            >
-              ↑
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              aria-label="Move down"
-              onClick={() =>
-                void rpc.call("moveRequest", {
-                  id: request.id,
-                  direction: "down",
-                })
-              }
-            >
-              ↓
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() =>
-                void rpc.call("moveRequest", {
-                  id: request.id,
-                  direction: "top",
-                })
-              }
-            >
-              Top
-            </Button>
-            <Button size="sm" disabled={busy} onClick={() => void dispatch()}>
-              Dispatch
-            </Button>
-          </>
+      <div className="max-h-[60vh] space-y-4 overflow-y-auto">
+        {card.body.trim() !== "" ? (
+          <p className="whitespace-pre-wrap text-sm text-muted-foreground">
+            {card.body}
+          </p>
         ) : null}
 
-        {request.chiefThreadId !== null ? (
+        {card.outcome !== null ? (
+          <p className="text-sm text-muted-foreground">{card.outcome}</p>
+        ) : null}
+
+        {card.question !== null ? (
+          <ItemCard
+            item={card.question}
+            rpc={rpc}
+            voice={voice}
+            onNavigate={onNavigate}
+          />
+        ) : null}
+
+        {card.workers.length > 0 ? (
+          <section className="space-y-1">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Working on it
+            </h3>
+            {card.workers.map((worker) => (
+              <button
+                key={worker.threadId}
+                type="button"
+                className="flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left hover:bg-state-hover"
+                onClick={() => onNavigate(worker.threadId)}
+              >
+                <span className="truncate text-sm text-foreground">
+                  {worker.title ?? worker.threadId}
+                </span>
+                <span
+                  className={`ml-auto shrink-0 text-[10px] ${workerTone(worker.liveStatus)}`}
+                >
+                  {worker.liveStatus ?? "idle"}
+                </span>
+              </button>
+            ))}
+          </section>
+        ) : null}
+
+        <section className="space-y-2">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Comments
+          </h3>
+          {!loaded ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : comments.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No comments yet. Anything you add here reaches whoever is working
+              this.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {comments.map((comment) => (
+                <article
+                  key={comment.id}
+                  className="space-y-1 rounded-md border border-border px-2 py-1.5"
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-foreground">
+                      {comment.authorName}
+                    </span>
+                    {comment.threadTitle !== null ? (
+                      <Chip>{comment.threadTitle}</Chip>
+                    ) : null}
+                    {comment.pending ? <Chip tone="urgent">pending</Chip> : null}
+                    {comment.notifiedCount > 0 ? (
+                      <Chip>sent to {comment.notifiedCount}</Chip>
+                    ) : null}
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      {relative(Date.parse(comment.createdAt))}
+                    </span>
+                  </div>
+                  <p className="whitespace-pre-wrap text-sm text-foreground">
+                    {comment.body}
+                  </p>
+                </article>
+              ))}
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <Input
+              value={draft}
+              placeholder={
+                canNotify
+                  ? "Add context — the worker gets it immediately"
+                  : "Add context — delivered once this has a task"
+              }
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void submit();
+                }
+              }}
+            />
+            <Button size="sm" disabled={busy || draft.trim() === ""} onClick={() => void submit()}>
+              Send
+            </Button>
+          </div>
+        </section>
+      </div>
+
+      <DialogFooter>
+        <div className="mr-auto flex flex-wrap gap-1">
+          {card.movable
+            ? DROPPABLE_LANES.filter((lane) => lane !== card.lane).map((lane) => (
+                <Button
+                  key={lane}
+                  size="sm"
+                  variant="outline"
+                  onClick={() => onMove(card, lane)}
+                >
+                  → {LANE_TITLES[lane]}
+                </Button>
+              ))
+            : null}
+        </div>
+        {card.chiefThreadId !== null ? (
           <Button
             size="sm"
-            variant="outline"
-            onClick={() => onNavigate(request.chiefThreadId!)}
+            variant="ghost"
+            onClick={() => onNavigate(card.chiefThreadId!)}
           >
             Open Chief
           </Button>
         ) : null}
+        <Button size="sm" variant="ghost" onClick={onClose}>
+          Close
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  );
+}
 
-        {!isClosed ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto"
-            onClick={() =>
-              void rpc.call("closeRequest", {
-                id: request.id,
-                cancelled: true,
-                outcome: null,
-              })
-            }
-          >
-            {isQueued ? "Delete" : "Cancel"}
-          </Button>
-        ) : (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto"
-            onClick={() => void rpc.call("reopenRequest", { id: request.id })}
-          >
-            Requeue
-          </Button>
-        )}
+function BoardCardTile({
+  card,
+  rpc,
+  onOpen,
+  onDragStart,
+}: {
+  card: BoardCard;
+  rpc: Rpc;
+  onOpen: (card: BoardCard) => void;
+  onDragStart: (card: BoardCard) => void;
+}) {
+  const question = card.question;
+  return (
+    <article
+      draggable={card.movable}
+      onDragStart={(event) => {
+        if (!card.movable) return;
+        event.dataTransfer.setData(DRAG_MIME, card.id);
+        event.dataTransfer.effectAllowed = "move";
+        onDragStart(card);
+      }}
+      className={`space-y-1.5 rounded-lg border bg-card p-2.5 ${
+        card.movable ? "cursor-grab active:cursor-grabbing" : ""
+      } ${card.urgent ? "border-destructive/50" : "border-border"} hover:border-ring`}
+    >
+      <button
+        type="button"
+        className="w-full text-left"
+        onClick={() => onOpen(card)}
+      >
+        <p className="text-sm text-foreground">{card.title}</p>
+      </button>
+
+      <div className="flex flex-wrap items-center gap-1">
+        {card.urgent ? <Chip tone="urgent">urgent</Chip> : null}
+        {card.priority !== "normal" ? <Chip>{card.priority}</Chip> : null}
+        {card.taskKey !== null ? <Chip tone="accent">{card.taskKey}</Chip> : null}
+        {card.kind === "question" ? <Chip tone="urgent">question</Chip> : null}
+        {card.commentCount > 0 ? <Chip>{card.commentCount} 💬</Chip> : null}
+        {card.workers.length > 0 ? (
+          <Chip tone="accent">{card.workers.length} 🧵</Chip>
+        ) : null}
       </div>
+
+      {question !== null ? (
+        <div className="space-y-1.5 border-t border-border/60 pt-1.5">
+          <p className="text-xs text-muted-foreground">{question.question}</p>
+          <div className="flex flex-wrap gap-1">
+            {question.options.slice(0, 3).map((option) => (
+              <Button
+                key={option}
+                size="sm"
+                variant="outline"
+                onClick={() =>
+                  void rpc
+                    .call("answer", { id: question.id, answer: option })
+                    .then(() => toast.success("Answered"))
+                    .catch((error: unknown) => toast.error(String(error)))
+                }
+              >
+                {option}
+              </Button>
+            ))}
+            <Button size="sm" variant="ghost" onClick={() => onOpen(card)}>
+              {question.options.length > 3 ? "More…" : "Answer…"}
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </article>
+  );
+}
+
+function BoardColumn({
+  lane,
+  cards,
+  rpc,
+  isCompact,
+  onOpen,
+  onDragStart,
+  onDrop,
+}: {
+  lane: BoardLane;
+  cards: BoardCard[];
+  rpc: Rpc;
+  isCompact: boolean;
+  onOpen: (card: BoardCard) => void;
+  onDragStart: (card: BoardCard) => void;
+  onDrop: (lane: BoardLane, cardId: string) => void;
+}) {
+  const [isOver, setOver] = React.useState(false);
+  const droppable = DROPPABLE_LANES.includes(lane);
+
+  return (
+    <section
+      className={`flex flex-col gap-2 rounded-lg border p-2 ${
+        isCompact ? "w-full" : "w-72 shrink-0"
+      } ${isOver ? "border-ring bg-state-hover" : "border-border/60"}`}
+      onDragOver={(event) => {
+        if (!droppable) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        setOver(true);
+      }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(event) => {
+        setOver(false);
+        if (!droppable) return;
+        event.preventDefault();
+        const cardId = event.dataTransfer.getData(DRAG_MIME);
+        if (cardId !== "") onDrop(lane, cardId);
+      }}
+    >
+      <header className="flex items-center gap-2 px-1">
+        <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          {LANE_TITLES[lane]}
+        </h2>
+        <span className="text-xs text-muted-foreground">{cards.length}</span>
+        {!droppable ? (
+          <span
+            className="ml-auto text-[10px] text-muted-foreground"
+            title="Cards arrive here when an agent asks you something, and leave when you answer"
+          >
+            auto
+          </span>
+        ) : null}
+      </header>
+
+      {cards.length === 0 ? (
+        <p className="px-1 pb-1 text-xs text-muted-foreground">
+          {lane === "queue"
+            ? "Nothing queued."
+            : lane === "needs_you"
+              ? "Nothing is waiting on you."
+              : lane === "in_progress"
+                ? "Nothing in flight."
+                : "Nothing finished recently."}
+        </p>
+      ) : (
+        cards.map((card) => (
+          <BoardCardTile
+            key={card.id}
+            card={card}
+            rpc={rpc}
+            onOpen={onOpen}
+            onDragStart={onDragStart}
+          />
+        ))
+      )}
+    </section>
   );
 }
 
@@ -904,11 +1181,10 @@ function RequestRow({
 function CommandCenter() {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
-  const { items, queue, isLoading, refresh } = useCommandCenter(rpc);
+  const { items, board, isLoading, refresh } = useCommandCenter(rpc);
   const [projects, setProjects] = React.useState<{ id: string; name: string }[]>(
     [],
   );
-  const [showDone, setShowDone] = React.useState(false);
   const [voice, setVoice] = React.useState<VoiceAvailability>({
     enabled: false,
     error: null,
@@ -934,189 +1210,212 @@ function CommandCenter() {
     [navigate],
   );
 
-  const queued = queue.requests.filter((request) => request.state === "queued");
-  const inFlight = queue.requests.filter(
-    (request) => request.state === "dispatched" || request.state === "in_flight",
+  const isCompact = useIsCompactViewport();
+  const [openCardId, setOpenCardId] = React.useState<string | null>(null);
+  /** A drop that would dispatch to Chief waits here for confirmation. */
+  const [pendingDispatch, setPendingDispatch] = React.useState<BoardCard | null>(
+    null,
   );
-  const closed = queue.requests.filter(
-    (request) => request.state === "done" || request.state === "cancelled",
+
+  const applyMove = React.useCallback(
+    async (card: BoardCard, lane: BoardLane) => {
+      try {
+        const result = await rpc.call("moveCard", {
+          cardId: card.id,
+          lane,
+        });
+        if (!result.ok) {
+          toast.error(result.error ?? "That move was refused.");
+          return;
+        }
+        if (result.dispatchedTo !== null) toast.success("Dispatched to Chief");
+        else if (result.error !== null) toast.warning(result.error);
+        await refresh();
+      } catch (error) {
+        toast.error(String(error));
+      }
+    },
+    [refresh, rpc],
   );
+
+  const handleDrop = React.useCallback(
+    (lane: BoardLane, cardId: string) => {
+      const card = board.cards.find((entry) => entry.id === cardId);
+      if (card === undefined || card.lane === lane) return;
+      // Leaving Queue sends real work to Chief and cannot be taken back.
+      if (lane === "in_progress" && card.dispatchOnAdvance) {
+        setPendingDispatch(card);
+        return;
+      }
+      void applyMove(card, lane);
+    },
+    [applyMove, board.cards],
+  );
+
+  const openCard =
+    openCardId === null
+      ? null
+      : board.cards.find((card) => card.id === openCardId) ?? null;
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="mx-auto w-full max-w-3xl space-y-5 p-4 md:p-5">
-        <Composer
-          rpc={rpc}
-          projects={projects}
-          voice={voice}
-          onAdded={refresh}
-        />
+    <div className="flex h-full flex-col">
+      <div className="space-y-3 p-4 pb-2 md:p-5 md:pb-2">
+        <div className="mx-auto w-full max-w-3xl space-y-3">
+          <Composer
+            rpc={rpc}
+            projects={projects}
+            voice={voice}
+            onAdded={refresh}
+          />
 
-        {queue.chiefError !== null ? (
-          <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
-            {queue.chiefError}
-          </p>
-        ) : null}
-
-        {!voice.enabled && voice.error !== null ? (
-          <p className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
-            {voice.error}
-          </p>
-        ) : null}
-
-        <Lane title="Needs you" count={items.open.length}>
-          {isLoading ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : items.open.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              Nothing is waiting on you.
+          {board.chiefError !== null ? (
+            <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
+              {board.chiefError}
             </p>
-          ) : (
-            <div className="space-y-2">
-              {items.open.map((item) => (
-                <ItemCard
-                  key={item.id}
-                  item={item}
-                  rpc={rpc}
-                  voice={voice}
-                  onNavigate={openThread}
-                />
-              ))}
-            </div>
-          )}
-        </Lane>
+          ) : null}
 
-        <Lane title="Queue" count={queued.length}>
-          {queued.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              Nothing queued. Type above to add work.
+          {board.tasksError !== null ? (
+            <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
+              {board.tasksError}
             </p>
-          ) : (
-            <div className="space-y-2">
-              {queued.map((request) => (
-                <RequestRow
-                  key={request.id}
-                  request={request}
-                  rpc={rpc}
-                  onNavigate={openThread}
-                />
-              ))}
-            </div>
-          )}
-        </Lane>
+          ) : null}
 
-        {inFlight.length > 0 ? (
-          <Lane title="In flight" count={inFlight.length}>
-            <div className="space-y-2">
-              {inFlight.map((request) => (
-                <RequestRow
-                  key={request.id}
-                  request={request}
-                  rpc={rpc}
-                  onNavigate={openThread}
-                />
-              ))}
-            </div>
-          </Lane>
-        ) : null}
+          {!voice.enabled && voice.error !== null ? (
+            <p className="rounded-md border border-border px-3 py-2 text-xs text-muted-foreground">
+              {voice.error}
+            </p>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-auto px-4 pb-4 md:px-5 md:pb-5">
+        {isLoading && board.cards.length === 0 ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : (
+          <div className={isCompact ? "space-y-3" : "flex gap-3"}>
+            {LANES_ORDER.map((lane) => (
+              <BoardColumn
+                key={lane}
+                lane={lane}
+                cards={board.cards.filter((card) => card.lane === lane)}
+                rpc={rpc}
+                isCompact={isCompact}
+                onOpen={(card) => setOpenCardId(card.id)}
+                onDragStart={() => undefined}
+                onDrop={handleDrop}
+              />
+            ))}
+          </div>
+        )}
 
         {items.snoozed.length > 0 ? (
-          <Lane title="Snoozed" count={items.snoozed.length}>
-            <div className="space-y-1">
-              {items.snoozed.map((item) => (
-                <div
-                  key={item.id}
-                  className="flex items-center gap-2 rounded-md border border-border px-3 py-2"
+          <section className="mt-4 space-y-1">
+            <h2 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Snoozed {items.snoozed.length}
+            </h2>
+            {items.snoozed.map((item) => (
+              <div
+                key={item.id}
+                className="flex items-center gap-2 rounded-md border border-border px-3 py-2"
+              >
+                <span className="truncate text-sm text-muted-foreground">
+                  {item.question}
+                </span>
+                <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                  {item.snoozedUntil !== null
+                    ? untilLabel(item.snoozedUntil)
+                    : ""}
+                </span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    void rpc.call("snooze", { id: item.id, untilMs: null })
+                  }
                 >
-                  <span className="truncate text-sm text-muted-foreground">
-                    {item.question}
-                  </span>
-                  <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
-                    {item.snoozedUntil !== null
-                      ? untilLabel(item.snoozedUntil)
-                      : ""}
-                  </span>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() =>
-                      void rpc.call("snooze", { id: item.id, untilMs: null })
-                    }
-                  >
-                    Wake
-                  </Button>
-                </div>
-              ))}
-            </div>
-          </Lane>
+                  Wake
+                </Button>
+              </div>
+            ))}
+          </section>
         ) : null}
+      </div>
 
-        <Lane
-          title="Done"
-          count={closed.length}
-          action={
+      <Dialog
+        open={openCard !== null}
+        onOpenChange={(open) => {
+          if (!open) setOpenCardId(null);
+        }}
+      >
+        {openCard !== null ? (
+          <CardDetail
+            card={openCard}
+            rpc={rpc}
+            voice={voice}
+            onClose={() => setOpenCardId(null)}
+            onNavigate={openThread}
+            onMove={(card, lane) => {
+              setOpenCardId(null);
+              if (lane === "in_progress" && card.dispatchOnAdvance) {
+                setPendingDispatch(card);
+                return;
+              }
+              void applyMove(card, lane);
+            }}
+          />
+        ) : null}
+      </Dialog>
+
+      <Dialog
+        open={pendingDispatch !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingDispatch(null);
+        }}
+      >
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Send this to Chief?</DialogTitle>
+            <DialogDescription>
+              Chief will start routing it to a project chief straight away. That
+              cannot be undone from here.
+            </DialogDescription>
+          </DialogHeader>
+          <p className="text-sm text-foreground">{pendingDispatch?.title}</p>
+          <DialogFooter>
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => setShowDone((current) => !current)}
+              onClick={() => setPendingDispatch(null)}
             >
-              {showDone ? "Hide" : "Show"}
+              Keep it queued
             </Button>
-          }
-        >
-          {showDone ? (
-            <div className="space-y-2">
-              {closed.map((request) => (
-                <RequestRow
-                  key={request.id}
-                  request={request}
-                  rpc={rpc}
-                  onNavigate={openThread}
-                />
-              ))}
-              {items.resolved.slice(0, 20).map((item) => (
-                <div
-                  key={item.id}
-                  className="space-y-1 rounded-md border border-border px-3 py-2"
-                >
-                  <p className="text-xs text-muted-foreground">
-                    {item.question}
-                  </p>
-                  <div className="flex items-center gap-2">
-                    <p className="truncate text-sm text-foreground">
-                      {item.answer ?? "(dismissed)"}
-                    </p>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="ml-auto shrink-0"
-                      aria-label="Take this answer back"
-                      onClick={() => void rpc.call("retract", { id: item.id })}
-                    >
-                      Retract
-                    </Button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </Lane>
-      </div>
+            <Button
+              size="sm"
+              onClick={() => {
+                const card = pendingDispatch;
+                setPendingDispatch(null);
+                if (card !== null) void applyMove(card, "in_progress");
+              }}
+            >
+              Dispatch
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
 
 function CommandCenterHeader() {
   const rpc = useRpc<typeof rpcContract>();
-  const { items, queue } = useCommandCenter(rpc);
-  const queued = queue.requests.filter(
-    (request) => request.state === "queued",
-  ).length;
-  const inFlight = queue.requests.filter(
-    (request) => request.state === "dispatched" || request.state === "in_flight",
-  ).length;
+  const { board } = useCommandCenter(rpc);
+  const count = (lane: BoardLane) =>
+    board.cards.filter((card) => card.lane === lane).length;
+  const needsYou = count("needs_you");
+  const queued = count("queue");
+  const inFlight = count("in_progress");
   const parts = [
-    items.open.length > 0 ? `${items.open.length} waiting on you` : null,
+    needsYou > 0 ? `${needsYou} waiting on you` : null,
     queued > 0 ? `${queued} queued` : null,
     inFlight > 0 ? `${inFlight} in flight` : null,
   ].filter((part): part is string => part !== null);

@@ -16,6 +16,7 @@ import {
   defineRpcContract,
   PLUGIN_CLI_OUTPUT_MAX_BYTES,
   type BbPluginApi,
+  type JsonValue,
 } from "@bb/plugin-sdk";
 import { z } from "zod";
 
@@ -99,6 +100,76 @@ const voiceClipInput = z.object({
 
 /** ~6 MB of audio — far more than a spoken command, far under the 25 MB cap. */
 const MAX_AUDIO_BASE64_LENGTH = 8_000_000;
+
+// ------------------------------------------------------------------- board
+
+const LANES = ["queue", "in_progress", "needs_you", "done"] as const;
+export type BoardLane = (typeof LANES)[number];
+
+/** Lane → BB task status, for writing a drag back to the task board. */
+const LANE_TASK_STATUS: Record<
+  Exclude<BoardLane, "needs_you">,
+  "todo" | "in_progress" | "done"
+> = {
+  queue: "todo",
+  in_progress: "in_progress",
+  done: "done",
+};
+
+const FINISHED_TASK_STATUSES = new Set(["done", "canceled"]);
+
+/**
+ * One card on the board, whatever it actually is underneath: a request you
+ * queued, a task the org created without you, or a bare question from an agent.
+ * The panel draws these and nothing else.
+ */
+const boardCardDto = z.object({
+  id: z.string(),
+  kind: z.enum(["request", "task", "question"]),
+  lane: z.enum(LANES),
+  title: z.string(),
+  body: z.string(),
+  priority: z.enum(PRIORITIES),
+  urgent: z.boolean(),
+  projectId: z.string().nullable(),
+  projectName: z.string().nullable(),
+  taskId: z.string().nullable(),
+  taskKey: z.string().nullable(),
+  taskStatus: z.string().nullable(),
+  chiefThreadId: z.string().nullable(),
+  outcome: z.string().nullable(),
+  createdAt: z.number(),
+  commentCount: z.number(),
+  /** Threads working this card, newest first. */
+  workers: z.array(
+    z.object({
+      threadId: z.string(),
+      title: z.string().nullable(),
+      liveStatus: z.string().nullable(),
+    }),
+  ),
+  /** The open question holding this card in Needs you, when there is one. */
+  question: itemDto.nullable(),
+  /** False for cards this panel may not move (bare questions). */
+  movable: z.boolean(),
+  /** True when moving out of Queue would dispatch work to Chief. */
+  dispatchOnAdvance: z.boolean(),
+});
+
+export type BoardCard = z.infer<typeof boardCardDto>;
+
+const boardCommentDto = z.object({
+  id: z.string(),
+  body: z.string(),
+  authorName: z.string(),
+  kind: z.enum(["user", "agent", "system"]),
+  threadId: z.string().nullable(),
+  threadTitle: z.string().nullable(),
+  createdAt: z.string(),
+  notifiedCount: z.number(),
+  /** True for a comment still queued locally because no task exists yet. */
+  pending: z.boolean(),
+});
 
 export const rpcContract = defineRpcContract({
   list: {
@@ -194,6 +265,48 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({
       projects: z.array(z.object({ id: z.string(), name: z.string() })),
+    }),
+  },
+  board: {
+    input: z.null(),
+    output: z.object({
+      cards: z.array(boardCardDto),
+      chiefThreadId: z.string().nullable(),
+      chiefError: z.string().nullable(),
+      /** Non-null when the Tasks plugin could not be read. */
+      tasksError: z.string().nullable(),
+    }),
+  },
+  moveCard: {
+    input: z
+      .object({ cardId: z.string(), lane: z.enum(LANES) })
+      .strict(),
+    output: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      /** Set when the move dispatched work to Chief. */
+      dispatchedTo: z.string().nullable(),
+    }),
+  },
+  cardComments: {
+    input: z.object({ cardId: z.string() }).strict(),
+    output: z.object({
+      comments: z.array(boardCommentDto),
+      /** False when comments cannot reach a worker yet (no task). */
+      canNotify: z.boolean(),
+      error: z.string().nullable(),
+    }),
+  },
+  addCardComment: {
+    input: z
+      .object({ cardId: z.string(), body: z.string().min(1) })
+      .strict(),
+    output: z.object({
+      ok: z.boolean(),
+      /** How many working threads were handed the comment. */
+      notified: z.number(),
+      pending: z.boolean(),
+      error: z.string().nullable(),
     }),
   },
   voiceStatus: {
@@ -473,6 +586,16 @@ export default async function plugin(bb: BbPluginApi) {
        outcome TEXT
      )`,
     `CREATE INDEX IF NOT EXISTS requests_state_pos ON requests (state, queue_pos)`,
+    // Comments written before a task exists. Flushed into the task board (and
+    // delivered to whoever is working it) the moment Chief acks a task key.
+    `CREATE TABLE IF NOT EXISTS request_comments (
+       id TEXT PRIMARY KEY,
+       request_id TEXT NOT NULL,
+       created_at INTEGER NOT NULL,
+       body TEXT NOT NULL,
+       delivered_task_id TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS request_comments_request ON request_comments (request_id, created_at)`,
   ]);
 
   function publish(): void {
@@ -954,12 +1077,15 @@ export default async function plugin(bb: BbPluginApi) {
     return { ok: true, threadId: chief.threadId, error: null };
   }
 
-  function ackRequest(id: string, taskKey: string): boolean {
+  async function ackRequest(id: string, taskKey: string): Promise<boolean> {
     if (requestRow(id) === undefined) return false;
     db.prepare(
       `UPDATE requests SET state = 'in_flight', task_key = ? WHERE id = ?`,
     ).run(taskKey, id);
     publish();
+    // Context you added while it was still queued now has somewhere to land.
+    const task = await resolveTaskByKey(taskKey);
+    if (task !== null) await flushPendingComments(id, task.id);
     return true;
   }
 
@@ -974,6 +1100,477 @@ export default async function plugin(bb: BbPluginApi) {
     ).run(cancelled ? "cancelled" : "done", outcome, Date.now(), id);
     publish();
     return true;
+  }
+
+  // ---------------------------------------------------------------- board
+
+  /**
+   * The Tasks plugin is the durable substrate: it owns task keys (which Chief's
+   * handoff contract requires), delivers comments to whoever is working a task,
+   * and survives the threads that come and go. This panel is the only surface
+   * the Captain should have to look at, so everything it holds is mirrored onto
+   * a card here. Every call tolerates Tasks being absent.
+   */
+  const taskRowSchema = z.looseObject({
+    id: z.string(),
+    key: z.string(),
+    title: z.string(),
+    description: z.string().nullish(),
+    status: z.string(),
+    priority: z.string().nullish(),
+    projectId: z.string().nullish(),
+    createdAt: z.string().nullish(),
+    updatedAt: z.string().nullish(),
+  });
+  type TaskRow = z.infer<typeof taskRowSchema>;
+
+  const MAX_TASK_PAGES = 20;
+  const MAX_ENRICHED_CARDS = 40;
+  /** Finished work stops being interesting quickly; keep Done readable. */
+  const DONE_WINDOW_MS = 3 * 24 * 60 * 60 * 1_000;
+
+  async function tasksCall<TOutput>(
+    method: string,
+    input: JsonValue,
+    outputSchema: z.ZodType<TOutput>,
+  ): Promise<TOutput> {
+    return await bb.sdk.plugins.callRpc({
+      pluginId: "tasks",
+      method,
+      input,
+      outputSchema,
+    });
+  }
+
+  const taskPageSchema = z.object({
+    tasks: z.array(taskRowSchema),
+    nextCursor: z.string().nullable(),
+  });
+  type TaskPage = z.infer<typeof taskPageSchema>;
+
+  async function listAllTasks(): Promise<TaskRow[]> {
+    const rows: TaskRow[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_TASK_PAGES; page += 1) {
+      const result: TaskPage = await tasksCall(
+        "listTasks",
+        cursor === null ? {} : { cursor },
+        taskPageSchema,
+      );
+      rows.push(...result.tasks);
+      cursor = result.nextCursor;
+      if (cursor === null) break;
+    }
+    return rows;
+  }
+
+  async function taskWorkers(
+    taskId: string,
+  ): Promise<{ threadId: string; title: string | null; liveStatus: string | null }[]> {
+    try {
+      const result = await tasksCall(
+        "listTaskThreads",
+        { taskId },
+        z.object({
+          taskThreads: z.array(
+            z.looseObject({
+              threadId: z.string(),
+              title: z.string().nullish(),
+              liveStatus: z.string().nullish(),
+            }),
+          ),
+        }),
+      );
+      return result.taskThreads.map((thread) => ({
+        threadId: thread.threadId,
+        title: thread.title ?? null,
+        liveStatus: thread.liveStatus ?? null,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  async function taskCommentCount(taskId: string): Promise<number> {
+    try {
+      const result = await tasksCall(
+        "listComments",
+        { taskId },
+        z.object({ comments: z.array(z.looseObject({ id: z.string() })) }),
+      );
+      return result.comments.length;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function resolveTaskByKey(taskKey: string): Promise<TaskRow | null> {
+    try {
+      const result = await tasksCall(
+        "getTaskByKey",
+        { taskKey },
+        z.object({ task: taskRowSchema.nullable() }),
+      );
+      return result.task;
+    } catch {
+      return null;
+    }
+  }
+
+  function pendingComments(
+    requestId: string,
+  ): { id: string; body: string; created_at: number }[] {
+    return db
+      .prepare<[string], { id: string; body: string; created_at: number }>(
+        `SELECT id, body, created_at FROM request_comments
+           WHERE request_id = ? AND delivered_task_id IS NULL
+           ORDER BY created_at ASC`,
+      )
+      .all(requestId);
+  }
+
+  function priorityFromTask(raw: string | null | undefined): {
+    priority: (typeof PRIORITIES)[number];
+    urgent: boolean;
+  } {
+    if (raw === "urgent") return { priority: "high", urgent: true };
+    if (raw === "high") return { priority: "high", urgent: false };
+    if (raw === "low" || raw === "none") return { priority: "low", urgent: false };
+    return { priority: "normal", urgent: false };
+  }
+
+  /** Open, non-snoozed questions keyed by the task they were asked about. */
+  function openQuestionsByTaskKey(): Map<string, InboxItem> {
+    const now = Date.now();
+    const map = new Map<string, InboxItem>();
+    for (const item of listItems().open) {
+      if (item.taskKey === null) continue;
+      if (item.snoozedUntil !== null && item.snoozedUntil > now) continue;
+      if (!map.has(item.taskKey)) map.set(item.taskKey, item);
+    }
+    void now;
+    return map;
+  }
+
+  function laneForRequest(
+    row: RequestRow,
+    task: TaskRow | null,
+    question: InboxItem | null,
+  ): BoardLane {
+    // A blocked card belongs where your attention is, whatever its status says.
+    if (question !== null) return "needs_you";
+    if (row.state === "done" || row.state === "cancelled") return "done";
+    if (task !== null && FINISHED_TASK_STATUSES.has(task.status)) return "done";
+    if (row.state === "dispatched" || row.state === "in_flight") {
+      return "in_progress";
+    }
+    return "queue";
+  }
+
+  function laneForTask(task: TaskRow, question: InboxItem | null): BoardLane {
+    if (question !== null) return "needs_you";
+    if (FINISHED_TASK_STATUSES.has(task.status)) return "done";
+    if (task.status === "in_progress" || task.status === "in_review") {
+      return "in_progress";
+    }
+    return "queue";
+  }
+
+  function parseTimestamp(raw: string | null | undefined): number {
+    if (raw === null || raw === undefined) return Date.now();
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : Date.now();
+  }
+
+  const LANE_ORDER: Record<BoardLane, number> = {
+    queue: 0,
+    in_progress: 1,
+    needs_you: 2,
+    done: 3,
+  };
+  const PRIORITY_ORDER: Record<(typeof PRIORITIES)[number], number> = {
+    high: 0,
+    normal: 1,
+    low: 2,
+  };
+
+  async function buildBoard(): Promise<{
+    cards: BoardCard[];
+    tasksError: string | null;
+  }> {
+    const questions = openQuestionsByTaskKey();
+    const requests = db
+      .prepare<[], RequestRow>(`SELECT * FROM requests`)
+      .all();
+
+    let tasks: TaskRow[] = [];
+    let tasksError: string | null = null;
+    try {
+      tasks = await listAllTasks();
+    } catch (error) {
+      tasksError = `Tasks plugin unreachable: ${String(error)}`;
+      bb.log.warn(tasksError);
+    }
+    const taskByKey = new Map(tasks.map((task) => [task.key, task]));
+
+    const projectNames = new Map<string, string>();
+    try {
+      for (const project of await bb.sdk.projects.list({
+        includePersonal: true,
+      })) {
+        projectNames.set(project.id, project.name);
+      }
+    } catch {
+      // Names are decoration; ids still identify the card.
+    }
+
+    const cards: BoardCard[] = [];
+    const claimedTaskIds = new Set<string>();
+    const claimedQuestionIds = new Set<string>();
+
+    for (const row of requests) {
+      const task = row.task_key !== null ? taskByKey.get(row.task_key) ?? null : null;
+      if (task !== null) claimedTaskIds.add(task.id);
+      const question = row.task_key !== null ? questions.get(row.task_key) ?? null : null;
+      if (question !== undefined && question !== null) {
+        claimedQuestionIds.add(question.id);
+      }
+      const lane = laneForRequest(row, task, question);
+      if (
+        lane === "done" &&
+        row.closed_at !== null &&
+        Date.now() - row.closed_at > DONE_WINDOW_MS
+      ) {
+        continue;
+      }
+      const projectId = row.project_id ?? task?.projectId ?? null;
+      cards.push({
+        id: row.id,
+        kind: "request",
+        lane,
+        title: row.title,
+        body: row.body,
+        priority: coercePriority(row.priority),
+        urgent: row.urgent === 1,
+        projectId,
+        projectName:
+          projectId !== null ? projectNames.get(projectId) ?? null : null,
+        taskId: task?.id ?? null,
+        taskKey: row.task_key,
+        taskStatus: task?.status ?? null,
+        chiefThreadId: row.chief_thread_id,
+        outcome: row.outcome,
+        createdAt: row.created_at,
+        commentCount: pendingComments(row.id).length,
+        workers: [],
+        question,
+        movable: true,
+        dispatchOnAdvance: row.state === "queued",
+      });
+    }
+
+    // Work the org created without you. Adopted so this panel is the whole
+    // picture and you never have to open the task board.
+    for (const task of tasks) {
+      if (claimedTaskIds.has(task.id)) continue;
+      const question = questions.get(task.key) ?? null;
+      if (question !== null) claimedQuestionIds.add(question.id);
+      const lane = laneForTask(task, question);
+      if (
+        lane === "done" &&
+        Date.now() - parseTimestamp(task.updatedAt) > DONE_WINDOW_MS
+      ) {
+        continue;
+      }
+      const { priority, urgent } = priorityFromTask(task.priority);
+      cards.push({
+        id: task.id,
+        kind: "task",
+        lane,
+        title: task.title,
+        body: task.description ?? "",
+        priority,
+        urgent,
+        projectId: task.projectId ?? null,
+        projectName:
+          task.projectId !== undefined && task.projectId !== null
+            ? projectNames.get(task.projectId) ?? null
+            : null,
+        taskId: task.id,
+        taskKey: task.key,
+        taskStatus: task.status,
+        chiefThreadId: null,
+        outcome: null,
+        createdAt: parseTimestamp(task.createdAt),
+        commentCount: 0,
+        workers: [],
+        question,
+        movable: true,
+        dispatchOnAdvance: false,
+      });
+    }
+
+    // Questions nobody's card claimed — the common case for a worker asking
+    // about work you never queued yourself.
+    for (const item of listItems().open) {
+      if (claimedQuestionIds.has(item.id)) continue;
+      const now = Date.now();
+      if (item.snoozedUntil !== null && item.snoozedUntil > now) continue;
+      cards.push({
+        id: item.id,
+        kind: "question",
+        lane: "needs_you",
+        title: item.task !== "" ? item.task : item.question,
+        body: "",
+        priority: item.urgent ? "high" : "normal",
+        urgent: item.urgent,
+        projectId: item.projectId,
+        projectName:
+          item.projectId !== null
+            ? projectNames.get(item.projectId) ?? null
+            : null,
+        taskId: null,
+        taskKey: item.taskKey,
+        taskStatus: null,
+        chiefThreadId: null,
+        outcome: null,
+        createdAt: item.createdAt,
+        commentCount: 0,
+        workers: [],
+        question: item,
+        movable: false,
+        dispatchOnAdvance: false,
+      });
+    }
+
+    cards.sort(
+      (left, right) =>
+        LANE_ORDER[left.lane] - LANE_ORDER[right.lane] ||
+        Number(right.urgent) - Number(left.urgent) ||
+        PRIORITY_ORDER[left.priority] - PRIORITY_ORDER[right.priority] ||
+        left.createdAt - right.createdAt,
+    );
+
+    // Enrich the cards a worker could plausibly be on. Each is an extra call
+    // into Tasks, so cap it rather than melt a large board.
+    const enrich = cards
+      .filter((card) => card.taskId !== null && card.lane !== "done")
+      .slice(0, MAX_ENRICHED_CARDS);
+    await Promise.all(
+      enrich.map(async (card) => {
+        const taskId = card.taskId;
+        if (taskId === null) return;
+        const [workers, comments] = await Promise.all([
+          taskWorkers(taskId),
+          taskCommentCount(taskId),
+        ]);
+        card.workers = workers;
+        card.commentCount += comments;
+      }),
+    );
+
+    return { cards, tasksError };
+  }
+
+  /** Push a lane change back onto the task board, best effort. */
+  async function writeTaskLane(
+    taskId: string,
+    lane: Exclude<BoardLane, "needs_you">,
+  ): Promise<string | null> {
+    try {
+      await tasksCall(
+        "boardMove",
+        { taskId, status: LANE_TASK_STATUS[lane], authorName: "You" },
+        z.looseObject({}),
+      );
+      return null;
+    } catch (error) {
+      return `Card moved, but the task board rejected it: ${String(error)}`;
+    }
+  }
+
+  async function moveCard(
+    cardId: string,
+    lane: BoardLane,
+  ): Promise<{ ok: boolean; error: string | null; dispatchedTo: string | null }> {
+    if (lane === "needs_you") {
+      return {
+        ok: false,
+        error:
+          "Needs you is derived from open questions — answer or ask one instead of moving a card here.",
+        dispatchedTo: null,
+      };
+    }
+
+    if (cardId.startsWith("inbx_")) {
+      return {
+        ok: false,
+        error: "That card is a question. Answer it and it leaves by itself.",
+        dispatchedTo: null,
+      };
+    }
+
+    const request = requestRow(cardId);
+    if (request !== undefined) {
+      let dispatchedTo: string | null = null;
+      if (lane === "in_progress" && request.state === "queued") {
+        const result = await dispatchRequest(cardId);
+        if (!result.ok) {
+          return { ok: false, error: result.error, dispatchedTo: null };
+        }
+        dispatchedTo = result.threadId;
+      } else if (lane === "queue") {
+        db.prepare(
+          `UPDATE requests
+             SET state = 'queued', queue_pos = ?, closed_at = NULL, outcome = NULL
+           WHERE id = ?`,
+        ).run(nextQueuePos(), cardId);
+        publish();
+      } else if (lane === "done") {
+        closeRequest(cardId, request.outcome, false);
+      } else if (lane === "in_progress" && request.state !== "in_flight") {
+        db.prepare(`UPDATE requests SET state = 'dispatched' WHERE id = ?`).run(
+          cardId,
+        );
+        publish();
+      }
+
+      // Keep the task board in step so the two can never disagree.
+      let error: string | null = null;
+      if (request.task_key !== null) {
+        const task = await resolveTaskByKey(request.task_key);
+        if (task !== null) error = await writeTaskLane(task.id, lane);
+      }
+      return { ok: true, error, dispatchedTo };
+    }
+
+    // An adopted task card: the task board is the only state it has.
+    const error = await writeTaskLane(cardId, lane);
+    publish();
+    return { ok: error === null, error, dispatchedTo: null };
+  }
+
+  /** Flush comments written before the task existed, notifying the worker. */
+  async function flushPendingComments(
+    requestId: string,
+    taskId: string,
+  ): Promise<void> {
+    for (const comment of pendingComments(requestId)) {
+      try {
+        await tasksCall(
+          "createComment",
+          { taskId, body: comment.body, notify: true },
+          z.looseObject({}),
+        );
+        db.prepare(
+          `UPDATE request_comments SET delivered_task_id = ? WHERE id = ?`,
+        ).run(taskId, comment.id);
+      } catch (error) {
+        bb.log.warn(`comment flush failed for ${comment.id}: ${String(error)}`);
+        return;
+      }
+    }
+    publish();
   }
 
   // ---------------------------------------------------------------- voice
@@ -1133,6 +1730,137 @@ export default async function plugin(bb: BbPluginApi) {
           name: project.name,
         })),
       };
+    },
+    async board() {
+      const [chief, built] = await Promise.all([chiefThread(), buildBoard()]);
+      return {
+        cards: built.cards,
+        chiefThreadId: chief.threadId,
+        chiefError: chief.error,
+        tasksError: built.tasksError,
+      };
+    },
+    async moveCard({ cardId, lane }) {
+      return await moveCard(cardId, lane);
+    },
+    async cardComments({ cardId }) {
+      const request = requestRow(cardId);
+      const taskId =
+        request !== undefined
+          ? request.task_key !== null
+            ? (await resolveTaskByKey(request.task_key))?.id ?? null
+            : null
+          : cardId.startsWith("inbx_")
+            ? null
+            : cardId;
+
+      const comments: z.infer<typeof boardCommentDto>[] = [];
+      let error: string | null = null;
+      if (taskId !== null) {
+        try {
+          const result = await tasksCall(
+            "listComments",
+            { taskId },
+            z.object({
+              comments: z.array(
+                z.looseObject({
+                  id: z.string(),
+                  body: z.string(),
+                  authorName: z.string(),
+                  kind: z.enum(["user", "agent", "system"]),
+                  threadId: z.string().nullish(),
+                  threadTitle: z.string().nullish(),
+                  createdAt: z.string(),
+                  notifiedCount: z.number(),
+                }),
+              ),
+            }),
+          );
+          for (const comment of result.comments) {
+            comments.push({
+              id: comment.id,
+              body: comment.body,
+              authorName: comment.authorName,
+              kind: comment.kind,
+              threadId: comment.threadId ?? null,
+              threadTitle: comment.threadTitle ?? null,
+              createdAt: comment.createdAt,
+              notifiedCount: comment.notifiedCount,
+              pending: false,
+            });
+          }
+        } catch (caught) {
+          error = String(caught);
+        }
+      }
+      if (request !== undefined) {
+        for (const pending of pendingComments(request.id)) {
+          comments.push({
+            id: pending.id,
+            body: pending.body,
+            authorName: "You",
+            kind: "user",
+            threadId: null,
+            threadTitle: null,
+            createdAt: new Date(pending.created_at).toISOString(),
+            notifiedCount: 0,
+            pending: true,
+          });
+        }
+      }
+      comments.sort((left, right) =>
+        left.createdAt.localeCompare(right.createdAt),
+      );
+      return { comments, canNotify: taskId !== null, error };
+    },
+    async addCardComment({ cardId, body }) {
+      if (cardId.startsWith("inbx_")) {
+        return {
+          ok: false,
+          notified: 0,
+          pending: false,
+          error: "Answer the question instead of commenting on it.",
+        };
+      }
+      const request = requestRow(cardId);
+      const taskId =
+        request !== undefined
+          ? request.task_key !== null
+            ? (await resolveTaskByKey(request.task_key))?.id ?? null
+            : null
+          : cardId;
+
+      // No task yet: hold it locally and deliver when Chief acks a task key.
+      if (taskId === null) {
+        if (request === undefined) {
+          return { ok: false, notified: 0, pending: false, error: "No such card." };
+        }
+        db.prepare(
+          `INSERT INTO request_comments (id, request_id, created_at, body)
+           VALUES (?, ?, ?, ?)`,
+        ).run(newId("ccm"), request.id, Date.now(), body);
+        publish();
+        return { ok: true, notified: 0, pending: true, error: null };
+      }
+
+      try {
+        const result = await tasksCall(
+          "createComment",
+          { taskId, body, notify: true },
+          z.object({
+            comment: z.looseObject({ notifiedCount: z.number() }),
+          }),
+        );
+        publish();
+        return {
+          ok: true,
+          notified: result.comment.notifiedCount,
+          pending: false,
+          error: null,
+        };
+      } catch (error) {
+        return { ok: false, notified: 0, pending: false, error: String(error) };
+      }
     },
     async voiceStatus() {
       try {
