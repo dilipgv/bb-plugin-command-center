@@ -691,9 +691,9 @@ function ItemCard({
               key={option}
               size="sm"
               variant={pendingOption === option ? "default" : "outline"}
-              className={
-                pendingOption === option ? "ring-2 ring-ring" : undefined
-              }
+              className={`h-auto max-w-full whitespace-normal py-1.5 text-left ${
+                pendingOption === option ? "ring-2 ring-ring" : ""
+              }`}
               disabled={busy}
               onClick={() => void resolve(option)}
             >
@@ -1084,6 +1084,9 @@ function CardDetail({
   );
 }
 
+/** Longest option label a lane-width button can show without truncating. */
+const QUICK_ANSWER_MAX_LABEL = 24;
+
 function BoardCardTile({
   card,
   rpc,
@@ -1096,6 +1099,12 @@ function BoardCardTile({
   onDragStart: (card: BoardCard) => void;
 }) {
   const question = card.question;
+  const canQuickAnswer =
+    question !== null &&
+    question.options.length > 0 &&
+    question.options.every(
+      (option) => option.length <= QUICK_ANSWER_MAX_LABEL,
+    );
   return (
     <article
       draggable={card.movable}
@@ -1105,7 +1114,7 @@ function BoardCardTile({
         event.dataTransfer.effectAllowed = "move";
         onDragStart(card);
       }}
-      className={`space-y-1.5 rounded-lg border bg-card p-2.5 ${
+      className={`min-w-0 space-y-1.5 overflow-hidden rounded-lg border bg-card p-2.5 ${
         card.movable ? "cursor-grab active:cursor-grabbing" : ""
       } ${card.urgent ? "border-destructive/50" : "border-border"} hover:border-ring`}
     >
@@ -1145,23 +1154,35 @@ function BoardCardTile({
             {question.question}
           </p>
           <div className="flex flex-wrap gap-1">
-            {question.options.slice(0, 3).map((option) => (
-              <Button
-                key={option}
-                size="sm"
-                variant="outline"
-                onClick={() =>
-                  void rpc
-                    .call("answer", { id: question.id, answer: option })
-                    .then(() => toast.success("Answered"))
-                    .catch((error: unknown) => toast.error(String(error)))
-                }
-              >
-                {option}
-              </Button>
-            ))}
-            <Button size="sm" variant="ghost" onClick={() => onOpen(card)}>
-              {question.options.length > 3 ? "More…" : "Answer…"}
+            {canQuickAnswer
+              ? question.options.slice(0, 3).map((option) => (
+                  <Button
+                    key={option}
+                    size="sm"
+                    variant="outline"
+                    className="max-w-full"
+                    onClick={() =>
+                      void rpc
+                        .call("answer", { id: question.id, answer: option })
+                        .then(() => toast.success("Answered"))
+                        .catch((error: unknown) => toast.error(String(error)))
+                    }
+                  >
+                    {option}
+                  </Button>
+                ))
+              : null}
+            <Button
+              size="sm"
+              variant={canQuickAnswer ? "ghost" : "outline"}
+              className="max-w-full"
+              onClick={() => onOpen(card)}
+            >
+              {canQuickAnswer && question.options.length > 3
+                ? "More…"
+                : canQuickAnswer
+                  ? "Answer…"
+                  : `Answer — ${question.options.length} options`}
             </Button>
           </div>
         </div>
