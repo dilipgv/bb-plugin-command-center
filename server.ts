@@ -26,6 +26,8 @@ import {
 import { execFile } from "node:child_process";
 import { z } from "zod";
 
+import { extractArtifacts, type Artifact } from "./lib/artifacts";
+
 import { CHIEF_MIGRATIONS } from "./chief/migrations";
 import { registerChief, type ChiefNavNeedsInput } from "./chief/server";
 import {
@@ -190,6 +192,12 @@ const boardCardDto = z.object({
 
 export type BoardCard = z.infer<typeof boardCardDto>;
 
+const artifactDto = z.object({
+  kind: z.enum(["pull-request", "confluence", "jira", "link"]),
+  url: z.string(),
+  label: z.string(),
+});
+
 const boardCommentDto = z.object({
   id: z.string(),
   body: z.string(),
@@ -348,6 +356,42 @@ export const rpcContract = defineRpcContract({
   attention: {
     input: z.null(),
     output: z.object({ needsYou: z.number() }),
+  },
+  archiveCard: {
+    input: z.object({ cardId: z.string() }).strict(),
+    output: z.object({
+      ok: z.boolean(),
+      /** True when archiving also dismissed an open question. */
+      dismissedQuestion: z.boolean(),
+      error: z.string().nullable(),
+    }),
+  },
+  unarchiveCard: {
+    input: z.object({ cardId: z.string() }).strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
+  archivedCards: {
+    input: z.null(),
+    output: z.object({
+      cards: z.array(
+        z.object({
+          cardId: z.string(),
+          archivedAt: z.number(),
+          title: z.string().nullable(),
+          taskKey: z.string().nullable(),
+        }),
+      ),
+    }),
+  },
+  /** Everything the reading view needs for one card, in one call. */
+  cardDocument: {
+    input: z.object({ cardId: z.string() }).strict(),
+    output: z.object({
+      card: boardCardDto.nullable(),
+      comments: z.array(boardCommentDto),
+      artifacts: z.array(artifactDto),
+      error: z.string().nullable(),
+    }),
   },
   voiceStatus: {
     input: z.null(),
@@ -664,6 +708,12 @@ export default async function plugin(bb: BbPluginApi) {
     // The real creation of the index whose original slot was consumed by the
     // pre-rebuild migration history — declared above, never run, so appended.
     `CREATE INDEX IF NOT EXISTS items_urgent_created ON items (urgent, created_at DESC)`,
+    // Cards the Captain has put away. Local to this plugin: a BB task has no
+    // archived status, and archiving here must not rewrite the task board.
+    `CREATE TABLE IF NOT EXISTS archived_cards (
+       card_id TEXT PRIMARY KEY,
+       archived_at INTEGER NOT NULL
+     )`,
   ]);
 
   function publish(): void {
@@ -1443,6 +1493,94 @@ export default async function plugin(bb: BbPluginApi) {
     low: 2,
   };
 
+  function archivedCardIds(): Set<string> {
+    return new Set(
+      db
+        .prepare<[], { card_id: string }>(
+          `SELECT card_id FROM archived_cards`,
+        )
+        .all()
+        .map((row) => row.card_id),
+    );
+  }
+
+  /** Gather the comment bodies a card carries, for artifacts and the viewer. */
+  async function cardComments(cardId: string): Promise<{
+    comments: z.infer<typeof boardCommentDto>[];
+    taskId: string | null;
+    canNotify: boolean;
+    error: string | null;
+  }> {
+    const request = requestRow(cardId);
+    const taskId =
+      request !== undefined
+        ? request.task_key !== null
+          ? ((await resolveTaskByKey(request.task_key))?.id ?? null)
+          : null
+        : cardId.startsWith("inbx_")
+          ? null
+          : cardId;
+
+    const comments: z.infer<typeof boardCommentDto>[] = [];
+    let error: string | null = null;
+    if (taskId !== null) {
+      try {
+        const result = await tasksCall(
+          "listComments",
+          { taskId },
+          z.object({
+            comments: z.array(
+              z.looseObject({
+                id: z.string(),
+                body: z.string(),
+                authorName: z.string(),
+                kind: z.enum(["user", "agent", "system"]),
+                threadId: z.string().nullish(),
+                threadTitle: z.string().nullish(),
+                createdAt: z.string(),
+                notifiedCount: z.number(),
+              }),
+            ),
+          }),
+        );
+        for (const comment of result.comments) {
+          comments.push({
+            id: comment.id,
+            body: comment.body,
+            authorName: comment.authorName,
+            kind: comment.kind,
+            threadId: comment.threadId ?? null,
+            threadTitle: comment.threadTitle ?? null,
+            createdAt: comment.createdAt,
+            notifiedCount: comment.notifiedCount,
+            pending: false,
+          });
+        }
+      } catch (caught) {
+        error = String(caught);
+      }
+    }
+    if (request !== undefined) {
+      for (const pending of pendingComments(request.id)) {
+        comments.push({
+          id: pending.id,
+          body: pending.body,
+          authorName: "You",
+          kind: "user",
+          threadId: null,
+          threadTitle: null,
+          createdAt: new Date(pending.created_at).toISOString(),
+          notifiedCount: 0,
+          pending: true,
+        });
+      }
+    }
+    comments.sort((left, right) =>
+      right.createdAt.localeCompare(left.createdAt),
+    );
+    return { comments, taskId, canNotify: taskId !== null, error };
+  }
+
   async function buildBoard(
     options: { enrich?: boolean } = {},
   ): Promise<{ cards: BoardCard[]; tasksError: string | null }> {
@@ -1475,11 +1613,13 @@ export default async function plugin(bb: BbPluginApi) {
       // Names are decoration; ids still identify the card.
     }
 
+    const archived = archivedCardIds();
     const cards: BoardCard[] = [];
     const claimedTaskIds = new Set<string>();
     const claimedQuestionIds = new Set<string>();
 
     for (const row of requests) {
+      if (archived.has(row.id)) continue;
       const task = row.task_key !== null ? taskByKey.get(row.task_key) ?? null : null;
       if (task !== null) claimedTaskIds.add(task.id);
       const question = row.task_key !== null ? questions.get(row.task_key) ?? null : null;
@@ -1525,7 +1665,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Work the org created without you. Adopted so this panel is the whole
     // picture and you never have to open the task board.
     for (const task of tasks) {
-      if (claimedTaskIds.has(task.id)) continue;
+      if (claimedTaskIds.has(task.id) || archived.has(task.id)) continue;
       const question = questions.get(task.key) ?? null;
       if (question !== null) claimedQuestionIds.add(question.id);
       const lane = laneForTask(task, question);
@@ -1568,7 +1708,7 @@ export default async function plugin(bb: BbPluginApi) {
     // Questions nobody's card claimed — the common case for a worker asking
     // about work you never queued yourself.
     for (const item of listItems().open) {
-      if (claimedQuestionIds.has(item.id)) continue;
+      if (claimedQuestionIds.has(item.id) || archived.has(item.id)) continue;
       const now = Date.now();
       if (item.snoozedUntil !== null && item.snoozedUntil > now) continue;
       cards.push({
@@ -2073,75 +2213,8 @@ export default async function plugin(bb: BbPluginApi) {
       return await moveCard(cardId, lane);
     },
     async cardComments({ cardId }) {
-      const request = requestRow(cardId);
-      const taskId =
-        request !== undefined
-          ? request.task_key !== null
-            ? (await resolveTaskByKey(request.task_key))?.id ?? null
-            : null
-          : cardId.startsWith("inbx_")
-            ? null
-            : cardId;
-
-      const comments: z.infer<typeof boardCommentDto>[] = [];
-      let error: string | null = null;
-      if (taskId !== null) {
-        try {
-          const result = await tasksCall(
-            "listComments",
-            { taskId },
-            z.object({
-              comments: z.array(
-                z.looseObject({
-                  id: z.string(),
-                  body: z.string(),
-                  authorName: z.string(),
-                  kind: z.enum(["user", "agent", "system"]),
-                  threadId: z.string().nullish(),
-                  threadTitle: z.string().nullish(),
-                  createdAt: z.string(),
-                  notifiedCount: z.number(),
-                }),
-              ),
-            }),
-          );
-          for (const comment of result.comments) {
-            comments.push({
-              id: comment.id,
-              body: comment.body,
-              authorName: comment.authorName,
-              kind: comment.kind,
-              threadId: comment.threadId ?? null,
-              threadTitle: comment.threadTitle ?? null,
-              createdAt: comment.createdAt,
-              notifiedCount: comment.notifiedCount,
-              pending: false,
-            });
-          }
-        } catch (caught) {
-          error = String(caught);
-        }
-      }
-      if (request !== undefined) {
-        for (const pending of pendingComments(request.id)) {
-          comments.push({
-            id: pending.id,
-            body: pending.body,
-            authorName: "You",
-            kind: "user",
-            threadId: null,
-            threadTitle: null,
-            createdAt: new Date(pending.created_at).toISOString(),
-            notifiedCount: 0,
-            pending: true,
-          });
-        }
-      }
-      // Newest first: the latest context is what you need when you open a card.
-      comments.sort((left, right) =>
-        right.createdAt.localeCompare(left.createdAt),
-      );
-      return { comments, canNotify: taskId !== null, error };
+      const { comments, canNotify, error } = await cardComments(cardId);
+      return { comments, canNotify, error };
     },
     async addCardComment({ cardId, body }) {
       if (cardId.startsWith("inbx_")) {
@@ -2201,6 +2274,114 @@ export default async function plugin(bb: BbPluginApi) {
         )
         .get(Date.now());
       return { needsYou: row?.open ?? 0 };
+    },
+    async archiveCard({ cardId }) {
+      // A question card hides an agent that is still waiting. Archiving it
+      // without answering would leave that agent blocked forever, so put the
+      // question away properly: dismissed, which tells the asker.
+      let dismissedQuestion = false;
+      if (getItem(cardId) !== undefined) {
+        resolveItem(cardId, "dismissed", null);
+        dismissedQuestion = true;
+      }
+      db.prepare(
+        `INSERT INTO archived_cards (card_id, archived_at) VALUES (?, ?)
+         ON CONFLICT(card_id) DO UPDATE SET archived_at = excluded.archived_at`,
+      ).run(cardId, Date.now());
+      db.prepare(`DELETE FROM notify_state WHERE card_id = ?`).run(cardId);
+      publish();
+      return { ok: true, dismissedQuestion, error: null };
+    },
+    unarchiveCard({ cardId }) {
+      const result = db
+        .prepare(`DELETE FROM archived_cards WHERE card_id = ?`)
+        .run(cardId);
+      publish();
+      return { ok: result.changes > 0 };
+    },
+    async archivedCards() {
+      const rows = db
+        .prepare<[], { card_id: string; archived_at: number }>(
+          `SELECT card_id, archived_at FROM archived_cards
+             ORDER BY archived_at DESC LIMIT 100`,
+        )
+        .all();
+      const titles = new Map<string, { title: string; taskKey: string | null }>();
+      for (const row of db
+        .prepare<[], { id: string; title: string; task_key: string | null }>(
+          `SELECT id, title, task_key FROM requests`,
+        )
+        .all()) {
+        titles.set(row.id, { title: row.title, taskKey: row.task_key });
+      }
+      for (const row of db
+        .prepare<[], { id: string; task: string; question: string }>(
+          `SELECT id, task, question FROM items`,
+        )
+        .all()) {
+        titles.set(row.id, {
+          title: row.task !== "" ? row.task : row.question,
+          taskKey: null,
+        });
+      }
+      try {
+        for (const task of await listAllTasks()) {
+          titles.set(task.id, { title: task.title, taskKey: task.key });
+        }
+      } catch {
+        // Names are decoration here; the id still identifies the card.
+      }
+      return {
+        cards: rows.map((row) => ({
+          cardId: row.card_id,
+          archivedAt: row.archived_at,
+          title: titles.get(row.card_id)?.title ?? null,
+          taskKey: titles.get(row.card_id)?.taskKey ?? null,
+        })),
+      };
+    },
+    async cardDocument({ cardId }) {
+      const board = await buildBoard({ enrich: false });
+      const card = board.cards.find((entry) => entry.id === cardId) ?? null;
+      const { comments, taskId, error } = await cardComments(cardId);
+
+      // The viewer is where you read, so resolve pull requests here whatever
+      // the lane — not only for In review as the board does.
+      let pullRequests = card?.pullRequests ?? [];
+      let unavailable = false;
+      if (taskId !== null) {
+        const lookup = await taskPullRequests(taskId);
+        pullRequests = lookup.pullRequests;
+        unavailable = lookup.unavailable;
+      }
+      if (card !== null) {
+        card.pullRequests = pullRequests;
+        card.pullRequestsUnavailable = unavailable;
+        if (taskId !== null) card.workers = await taskWorkers(taskId);
+      }
+
+      // Pull requests are first-class artifacts; everything else is mined out of
+      // the prose, which is where agents actually leave links.
+      const fromPrs: Artifact[] = pullRequests.map((pullRequest) => ({
+        kind: "pull-request" as const,
+        url: pullRequest.url,
+        label: `PR #${pullRequest.number}`,
+      }));
+      const mined = extractArtifacts([
+        card?.title,
+        card?.body,
+        card?.outcome,
+        card?.question?.question,
+        card?.question?.reviewUrl,
+        ...comments.map((comment) => comment.body),
+      ]);
+      const seen = new Set(fromPrs.map((artifact) => artifact.url));
+      const artifacts = [
+        ...fromPrs,
+        ...mined.filter((artifact) => !seen.has(artifact.url)),
+      ];
+
+      return { card, comments, artifacts, error };
     },
     async voiceStatus() {
       try {

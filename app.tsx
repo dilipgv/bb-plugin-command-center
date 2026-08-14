@@ -37,6 +37,7 @@ import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { useShortcut } from "@/hooks/useShortcut";
 import { useVoiceCapture } from "@/hooks/useVoiceCapture";
+import { CardViewer } from "./CardViewer";
 import { ChiefHeader, ChiefPanel } from "./chief/panel";
 import { mountNavBadge } from "./nav-badge";
 import type {
@@ -1091,11 +1092,15 @@ function BoardCardTile({
   card,
   rpc,
   onOpen,
+  onRead,
+  onArchive,
   onDragStart,
 }: {
   card: BoardCard;
   rpc: Rpc;
   onOpen: (card: BoardCard) => void;
+  onRead: (card: BoardCard) => void;
+  onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
 }) {
   const question = card.question;
@@ -1114,14 +1119,15 @@ function BoardCardTile({
         event.dataTransfer.effectAllowed = "move";
         onDragStart(card);
       }}
-      className={`min-w-0 space-y-1.5 overflow-hidden rounded-lg border bg-card p-2.5 ${
+      className={`group min-w-0 space-y-1.5 overflow-hidden rounded-lg border bg-card p-2.5 ${
         card.movable ? "cursor-grab active:cursor-grabbing" : ""
       } ${card.urgent ? "border-destructive/50" : "border-border"} hover:border-ring`}
     >
       <button
         type="button"
         className="w-full text-left"
-        onClick={() => onOpen(card)}
+        title="Open the reading view"
+        onClick={() => onRead(card)}
       >
         <p className="line-clamp-3 text-sm text-foreground">{card.title}</p>
       </button>
@@ -1146,6 +1152,18 @@ function BoardCardTile({
         {card.workers.length > 0 ? (
           <Chip tone="accent">{card.workers.length} 🧵</Chip>
         ) : null}
+        <button
+          type="button"
+          aria-label="Archive this card"
+          title="Archive"
+          className="ml-auto shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+          onClick={(event) => {
+            event.stopPropagation();
+            onArchive(card);
+          }}
+        >
+          <Icon name="Archive" className="size-3.5" aria-hidden="true" />
+        </button>
       </div>
 
       {question !== null ? (
@@ -1197,6 +1215,8 @@ function BoardColumn({
   rpc,
   isCompact,
   onOpen,
+  onRead,
+  onArchive,
   onDragStart,
   onDrop,
 }: {
@@ -1205,6 +1225,8 @@ function BoardColumn({
   rpc: Rpc;
   isCompact: boolean;
   onOpen: (card: BoardCard) => void;
+  onRead: (card: BoardCard) => void;
+  onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
   onDrop: (lane: BoardLane, cardId: string) => void;
 }) {
@@ -1267,6 +1289,8 @@ function BoardColumn({
             card={card}
             rpc={rpc}
             onOpen={onOpen}
+            onRead={onRead}
+            onArchive={onArchive}
             onDragStart={onDragStart}
           />
         ))
@@ -1277,13 +1301,16 @@ function BoardColumn({
 
 // ------------------------------------------------------------------- panel
 
-function CommandCenter() {
+function CommandCenter({ subPath }: { subPath: string }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const { items, board, isLoading, refresh } = useCommandCenter(rpc);
   const [projects, setProjects] = React.useState<{ id: string; name: string }[]>(
     [],
   );
+  const [archived, setArchived] = React.useState<
+    { cardId: string; archivedAt: number; title: string | null; taskKey: string | null }[]
+  >([]);
   const [voice, setVoice] = React.useState<VoiceAvailability>({
     enabled: false,
     error: null,
@@ -1314,6 +1341,45 @@ function CommandCenter() {
   /** A drop that would dispatch to Chief waits here for confirmation. */
   const [pendingDispatch, setPendingDispatch] = React.useState<BoardCard | null>(
     null,
+  );
+
+  // The reading view owns a route, so a card is deep-linkable and browser back
+  // returns to the board.
+  const openViewer = React.useCallback(
+    (cardId: string) => {
+      navigate.toPluginPanel("inbox", { subPath: cardId });
+    },
+    [navigate],
+  );
+
+  const loadArchived = React.useCallback(async () => {
+    try {
+      const result = await rpc.call("archivedCards");
+      setArchived(result.cards);
+    } catch {
+      setArchived([]);
+    }
+  }, [rpc]);
+
+  React.useEffect(() => {
+    void loadArchived();
+  }, [loadArchived]);
+
+  const archive = React.useCallback(
+    async (cardId: string) => {
+      try {
+        const result = await rpc.call("archiveCard", { cardId });
+        toast.success(
+          result.dismissedQuestion
+            ? "Archived — the question was dismissed, so the asker is unblocked."
+            : "Archived",
+        );
+        await Promise.all([refresh(), loadArchived()]);
+      } catch (error) {
+        toast.error(String(error));
+      }
+    },
+    [loadArchived, refresh, rpc],
   );
 
   const applyMove = React.useCallback(
@@ -1355,6 +1421,19 @@ function CommandCenter() {
     openCardId === null
       ? null
       : board.cards.find((card) => card.id === openCardId) ?? null;
+
+  // A card id in the route means "read this one" — the whole panel becomes the
+  // document, rather than the board with something floating over it.
+  const viewing = subPath.trim();
+  if (viewing !== "") {
+    return (
+      <CardViewer
+        cardId={viewing}
+        rpc={rpc}
+        onBack={() => navigate.toPluginPanel("inbox")}
+      />
+    );
+  }
 
   return (
     <div className="flex h-full flex-col">
@@ -1403,12 +1482,56 @@ function CommandCenter() {
                 rpc={rpc}
                 isCompact={isCompact}
                 onOpen={(card) => setOpenCardId(card.id)}
+                onRead={(card) => openViewer(card.id)}
+                onArchive={(card) => void archive(card.id)}
                 onDragStart={() => undefined}
                 onDrop={handleDrop}
               />
             ))}
           </div>
         )}
+
+        {archived.length > 0 ? (
+          <details className="mt-4 border-t border-border pt-3">
+            <summary className="cursor-pointer text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Archived {archived.length}
+            </summary>
+            <div className="mt-2 space-y-1">
+              {archived.map((entry) => (
+                <div
+                  key={entry.cardId}
+                  className="flex items-center gap-2 rounded-md border border-border px-3 py-1.5"
+                >
+                  {entry.taskKey !== null ? (
+                    <Chip tone="accent">{entry.taskKey}</Chip>
+                  ) : null}
+                  <span className="min-w-0 truncate text-sm text-muted-foreground">
+                    {entry.title ?? entry.cardId}
+                  </span>
+                  <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                    {relative(entry.archivedAt)}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="shrink-0"
+                    onClick={() =>
+                      void rpc
+                        .call("unarchiveCard", { cardId: entry.cardId })
+                        .then(async () => {
+                          toast.success("Restored to the board");
+                          await Promise.all([refresh(), loadArchived()]);
+                        })
+                        .catch((error: unknown) => toast.error(String(error)))
+                    }
+                  >
+                    Restore
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </details>
+        ) : null}
 
         {items.snoozed.length > 0 ? (
           <section className="mt-4 space-y-1">

@@ -20,6 +20,34 @@ Two lanes run in opposite directions through the board:
   routes it to the owning project chief, which creates the task and hands it to
   an architect. Requests are never dispatched automatically.
 
+## The reading view
+
+Clicking a card's title opens it at `…/inbox/<cardId>` — a document, not a modal:
+deep-linkable, browser-back returns to the board, and on a phone it is a page.
+
+**Everything starts collapsed.** A card can carry 90,000 characters across two
+dozen updates, so the page opens as a scannable table of contents — request,
+outcome, each update with its author, time, size and first line — and you expand
+what you came for. Expanding renders full Markdown: headings, tables, code.
+
+Artifacts sit at the top: pull requests come from the Tasks plugin, and
+everything else is mined out of the prose the card already carries, because
+that is where agents actually leave links. Confluence links are named by their
+page title, draft state or space rather than all reading "Confluence page".
+
+The board's own click-through still opens the quick dialog for answering and
+commenting; the title opens the reading view.
+
+## Archiving
+
+Every card has an archive control (the tile's hover icon, or the button in the
+reading view). Archiving is **local to this plugin** — it never rewrites a BB
+task's status — and reversible from `Archived` at the foot of the board.
+
+One special case: archiving a **question** also dismisses it. A question card
+hides an agent that is still waiting, so putting it away silently would block
+that agent forever; dismissing tells the asker to proceed.
+
 ## Shortcuts
 
 | Keys | Does |
