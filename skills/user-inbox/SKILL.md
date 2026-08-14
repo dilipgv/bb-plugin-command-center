@@ -163,6 +163,34 @@ keep the Captain's picture accurate — with two extra obligations:
    Done is the Captain's manual step; doing it for them removes their last look
    at the work.
 
+### The two endings, and never a third
+
+Work must end in one of two visible states. The Captain watches the board and is
+notified on both; anything else is silence, and silence means they never look at
+the card again.
+
+**Done → In review.** The moment the work is finished, park it:
+
+```sh
+bb inbox ready cc_a1b2c3 --outcome "PR #412 is open"
+```
+
+**Stuck → Needs you.** The moment you cannot proceed — a decision, a missing
+credential, an approval, an ambiguity — file it as a question:
+
+```sh
+bb inbox ask --task "<key>" --question "…" --option "…" --option "…" \
+  --asked-by "worker: <key>"
+```
+
+**A blocker buried in a comment is not a question.** A comment notifies the
+Captain that you replied, but it leaves the card sitting in a lane that claims
+someone is working on it. If you need something, ask; if you are done, park it.
+
+A card left in progress with nothing said for a few hours is flagged **stalled**
+and moved into Needs you by the plugin itself, so going quiet does not hide work
+— it just makes the report worse than if you had asked.
+
 Never silently drop a request: if it is not actionable, ask about it through
 `bb inbox ask` rather than leaving the card sitting in flight.
 

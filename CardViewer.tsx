@@ -17,6 +17,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import { QuestionCard, type VoiceAvailability } from "./card-parts";
 import { previewMarkdown } from "./lib/markdown-preview";
 import type { BoardCard, BoardLane, rpcContract } from "./server";
 
@@ -64,6 +65,64 @@ function when(iso: string): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+/**
+ * Stop a worker. Two-step on purpose: stopping discards whatever the agent was
+ * part-way through, and this button sits beside a navigation control.
+ */
+function StopWorker({
+  threadId,
+  isRunning,
+  rpc,
+  onStopped,
+}: {
+  threadId: string;
+  isRunning: boolean;
+  rpc: Rpc;
+  onStopped: () => void;
+}) {
+  const [armed, setArmed] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!armed) return;
+    // Forget the intent if it is not confirmed promptly.
+    const timer = window.setTimeout(() => setArmed(false), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [armed]);
+
+  if (!isRunning) return null;
+  return (
+    <Button
+      size="sm"
+      variant={armed ? "destructive" : "ghost"}
+      disabled={busy}
+      className="shrink-0"
+      onClick={(event) => {
+        event.stopPropagation();
+        if (!armed) {
+          setArmed(true);
+          return;
+        }
+        setBusy(true);
+        void rpc
+          .call("stopThread", { threadId })
+          .then((result) => {
+            if (result.ok) toast.success("Stopped the agent");
+            else toast.error(result.error ?? "Could not stop it");
+            onStopped();
+          })
+          .catch((error: unknown) => toast.error(String(error)))
+          .finally(() => {
+            setBusy(false);
+            setArmed(false);
+          });
+      }}
+    >
+      {armed ? "Stop — confirm" : "Stop"}
+    </Button>
+  );
 }
 
 /**
@@ -141,10 +200,12 @@ function Section({
 export function CardViewer({
   cardId,
   rpc,
+  voice,
   onBack,
 }: {
   cardId: string;
   rpc: Rpc;
+  voice: VoiceAvailability;
   onBack: () => void;
 }) {
   const navigate = useBbNavigate();
@@ -232,7 +293,7 @@ export function CardViewer({
   return (
     <div className="h-full overflow-y-auto">
       {/* One measure, wide enough to read and narrow enough not to tire. */}
-      <article className="mx-auto w-full max-w-3xl space-y-5 px-4 py-5 md:px-6">
+      <article className="mx-auto w-full max-w-4xl space-y-5 px-4 py-5 md:px-6">
         <Button size="sm" variant="ghost" className="-ml-2" onClick={onBack}>
           ← Board
         </Button>
@@ -246,6 +307,9 @@ export function CardViewer({
             ) : null}
             <span>{LANE_LABEL[card.lane]}</span>
             {card.projectName !== null ? <span>· {card.projectName}</span> : null}
+            {card.stalled ? (
+              <span className="text-destructive">· stalled</span>
+            ) : null}
             {card.urgent ? (
               <span className="text-destructive">· urgent</span>
             ) : null}
@@ -312,56 +376,59 @@ export function CardViewer({
 
         {card.question !== null ? (
           <Section title="Waiting on you">
-            <div className="min-w-0 overflow-x-auto">
-              <Markdown content={card.question.question} />
-            </div>
-            <div className="flex flex-wrap gap-2 pt-1">
-              {card.question.options.map((option) => (
-                <Button
-                  key={option}
-                  size="sm"
-                  variant="outline"
-                  className="h-auto max-w-full whitespace-normal py-1.5 text-left"
-                  onClick={() =>
-                    void rpc
-                      .call("answer", {
-                        id: card.question?.id ?? "",
-                        answer: option,
-                      })
-                      .then(() => {
-                        toast.success("Answered");
-                        void load();
-                      })
-                      .catch((error: unknown) => toast.error(String(error)))
-                  }
-                >
-                  {option}
-                </Button>
-              ))}
-            </div>
+            <QuestionCard
+              item={card.question}
+              rpc={rpc}
+              voice={voice}
+              onNavigate={(threadId) => navigate.toThread(threadId)}
+            />
           </Section>
         ) : null}
 
         {card.workers.length > 0 ? (
           <Disclosure
             title="Working on it"
-            preview={`${card.workers.length} thread${card.workers.length === 1 ? "" : "s"}`}
+            preview={`${card.workers.length} thread${card.workers.length === 1 ? "" : "s"}${
+              card.workers.some(
+                (worker) =>
+                  worker.liveStatus === "active" ||
+                  worker.liveStatus === "starting",
+              )
+                ? " · running now"
+                : ""
+            }`}
+            defaultOpen={card.workers.some(
+              (worker) =>
+                worker.liveStatus === "active" ||
+                worker.liveStatus === "starting",
+            )}
           >
             <div className="space-y-1">
               {card.workers.map((worker) => (
-                <button
+                <div
                   key={worker.threadId}
-                  type="button"
-                  className="flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left hover:bg-state-hover"
-                  onClick={() => navigate.toThread(worker.threadId)}
+                  className="flex items-center gap-2 rounded-md border border-border px-2 py-1"
                 >
-                  <span className="truncate text-sm text-foreground">
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 truncate py-0.5 text-left text-sm text-foreground hover:underline"
+                    onClick={() => navigate.toThread(worker.threadId)}
+                  >
                     {worker.title ?? worker.threadId}
-                  </span>
-                  <span className="ml-auto shrink-0 text-[10px] text-muted-foreground">
+                  </button>
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
                     {worker.liveStatus ?? "idle"}
                   </span>
-                </button>
+                  <StopWorker
+                    threadId={worker.threadId}
+                    isRunning={
+                      worker.liveStatus === "active" ||
+                      worker.liveStatus === "starting"
+                    }
+                    rpc={rpc}
+                    onStopped={() => void load()}
+                  />
+                </div>
               ))}
             </div>
           </Disclosure>
@@ -400,14 +467,11 @@ export function CardViewer({
               {summaries.map((entry) => (
                 <Disclosure
                   key={entry.id}
-                  title={entry.authorName}
+                  title={entry.threadTitle ?? entry.authorName}
                   preview={previewMarkdown(entry.body)}
                   meta={
                     <span className="flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
                       <span>{when(entry.createdAt)}</span>
-                      {entry.threadTitle !== null ? (
-                        <span className="truncate">{entry.threadTitle}</span>
-                      ) : null}
                       {entry.pending ? (
                         <span className="text-destructive">pending delivery</span>
                       ) : null}

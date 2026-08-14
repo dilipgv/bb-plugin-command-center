@@ -27,6 +27,8 @@ import { execFile } from "node:child_process";
 import { z } from "zod";
 
 import { extractArtifacts, type Artifact } from "./lib/artifacts";
+import { previewMarkdown } from "./lib/markdown-preview";
+import { isStalled, lastActivity } from "./lib/stall";
 
 import { CHIEF_MIGRATIONS } from "./chief/migrations";
 import { registerChief, type ChiefNavNeedsInput } from "./chief/server";
@@ -169,6 +171,14 @@ const boardCardDto = z.object({
   ),
   /** The open question holding this card in Needs you, when there is one. */
   question: itemDto.nullable(),
+  /**
+   * True when work claimed to be in progress has gone quiet for longer than the
+   * stall threshold. Such a card is moved into Needs you: nobody is working it
+   * and nobody has said why, which needs the Captain, not patience.
+   */
+  stalled: z.boolean(),
+  /** Newest agent activity seen on this card, if any has been observed. */
+  lastActivityAt: z.number().nullable(),
   /** Pull requests behind this card. Only resolved for the In review lane. */
   pullRequests: z.array(
     z.object({
@@ -392,6 +402,14 @@ export const rpcContract = defineRpcContract({
       artifacts: z.array(artifactDto),
       error: z.string().nullable(),
     }),
+  },
+  /**
+   * Interrupt a worker mid-turn. The card is the only place the Captain sees a
+   * runaway agent, so it is the right place to stop one.
+   */
+  stopThread: {
+    input: z.object({ threadId: z.string() }).strict(),
+    output: z.object({ ok: z.boolean(), error: z.string().nullable() }),
   },
   voiceStatus: {
     input: z.null(),
@@ -628,6 +646,12 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Play a sound with notifications",
       default: false,
     },
+    stallHours: {
+      type: "select",
+      label: "Flag work as stalled after (hours of silence)",
+      options: ["off", "1", "3", "6", "12", "24"],
+      default: "3",
+    },
   });
 
   const db = bb.storage.database();
@@ -714,6 +738,11 @@ export default async function plugin(bb: BbPluginApi) {
        card_id TEXT PRIMARY KEY,
        archived_at INTEGER NOT NULL
      )`,
+    // Activity tracking: an agent replying is the signal that was missing, and a
+    // card whose activity stops is the other one.
+    `ALTER TABLE notify_state ADD COLUMN last_comment_at INTEGER`,
+    `ALTER TABLE notify_state ADD COLUMN last_comment_id TEXT`,
+    `ALTER TABLE notify_state ADD COLUMN stalled_notified_at INTEGER`,
   ]);
 
   function publish(): void {
@@ -910,6 +939,134 @@ export default async function plugin(bb: BbPluginApi) {
     return null;
   }
 
+  /** Active lanes are the only ones where a reply is news. */
+  const ACTIVE_LANES: BoardLane[] = ["in_progress", "in_review", "needs_you"];
+  /** One Tasks call per card, so cap the poll. */
+  const MAX_ACTIVITY_POLL = 15;
+
+  /**
+   * The signal that was missing: an agent replied.
+   *
+   * A card can collect a dozen updates without its lane ever changing, so the
+   * lane sweep never mentioned them — which is exactly how work gets finished,
+   * or gets stuck, without the Captain hearing about it. Comments arrive on the
+   * Tasks plugin's own realtime channel, which this plugin cannot subscribe to,
+   * so this polls the active cards and reports what is new since last time.
+   */
+  async function sweepActivity(): Promise<void> {
+    const { mode, sound } = await notifySetting();
+    if (mode === "off") return;
+
+    const { cards } = await buildBoard({ enrich: false });
+    const active = cards
+      .filter((card) => card.taskId !== null && ACTIVE_LANES.includes(card.lane))
+      .slice(0, MAX_ACTIVITY_POLL);
+
+    const seen = new Map<string, { id: string | null; at: number | null }>();
+    for (const row of db
+      .prepare<
+        [],
+        { card_id: string; last_comment_id: string | null; last_comment_at: number | null }
+      >(`SELECT card_id, last_comment_id, last_comment_at FROM notify_state`)
+      .all()) {
+      seen.set(row.card_id, { id: row.last_comment_id, at: row.last_comment_at });
+    }
+
+    const record = db.prepare(
+      `INSERT INTO notify_state (card_id, lane, task_status, notified_at, last_comment_id, last_comment_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(card_id) DO UPDATE
+         SET last_comment_id = excluded.last_comment_id,
+             last_comment_at = excluded.last_comment_at`,
+    );
+
+    const announce: { subtitle: string; body: string }[] = [];
+    for (const card of active) {
+      const { comments } = await cardComments(card.id);
+      // Your own comments are not news, and neither is a status line.
+      const newest = comments.find(
+        (comment) => comment.kind === "agent" && !comment.pending,
+      );
+      if (newest === undefined) continue;
+      const at = Date.parse(newest.createdAt);
+      if (!Number.isFinite(at)) continue;
+
+      const previous = seen.get(card.id);
+      const isNew =
+        previous === undefined ||
+        previous.id === null ||
+        (previous.id !== newest.id && (previous.at ?? 0) < at);
+      record.run(
+        card.id,
+        card.lane,
+        card.taskStatus,
+        Date.now(),
+        newest.id,
+        at,
+      );
+      // First sight of a card records where it is without announcing history.
+      if (!isNew || previous === undefined || previous.id === null) continue;
+
+      const label = card.taskKey !== null ? `${card.taskKey} · ` : "";
+      announce.push({
+        subtitle: `${label}replied`,
+        body: previewMarkdown(newest.body, 120) || card.title,
+      });
+    }
+
+    if (announce.length === 0) return;
+    if (announce.length > NOTIFY_BURST_LIMIT) {
+      await notifyMac(
+        NOTIFY_TITLE,
+        `${announce.length} cards replied`,
+        announce.map((entry) => entry.subtitle.replace(" · replied", "")).join(", "),
+        sound,
+      );
+      return;
+    }
+    for (const entry of announce) {
+      await notifyMac(NOTIFY_TITLE, entry.subtitle, entry.body, sound);
+    }
+  }
+
+  /** Announce a card that has gone quiet, once per stall. */
+  async function sweepStalled(): Promise<void> {
+    const { mode, sound } = await notifySetting();
+    if (mode === "off") return;
+    const { cards } = await buildBoard({ enrich: false });
+    const stalled = cards.filter((card) => card.stalled);
+    for (const card of stalled) {
+      const row = db
+        .prepare<[string], { stalled_notified_at: number | null }>(
+          `SELECT stalled_notified_at FROM notify_state WHERE card_id = ?`,
+        )
+        .get(card.id);
+      if (row?.stalled_notified_at != null) continue;
+      db.prepare(
+        `INSERT INTO notify_state (card_id, lane, task_status, notified_at, stalled_notified_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(card_id) DO UPDATE SET stalled_notified_at = excluded.stalled_notified_at`,
+      ).run(card.id, card.lane, card.taskStatus, Date.now(), Date.now());
+      const since =
+        card.lastActivityAt ?? card.createdAt;
+      const hours = Math.max(1, Math.round((Date.now() - since) / 3_600_000));
+      await notifyMac(
+        NOTIFY_TITLE,
+        `${card.taskKey !== null ? `${card.taskKey} · ` : ""}stalled ${hours}h`,
+        `Nothing said for ${hours}h — ${card.title}`,
+        sound,
+      );
+    }
+    // A card that speaks again is eligible to be flagged if it stalls anew.
+    for (const card of cards) {
+      if (!card.stalled) {
+        db.prepare(
+          `UPDATE notify_state SET stalled_notified_at = NULL WHERE card_id = ?`,
+        ).run(card.id);
+      }
+    }
+  }
+
   let delivering = false;
 
   async function deliverPending(): Promise<void> {
@@ -970,12 +1127,20 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.background.service("notify-watch", {
     async start(signal) {
+      let tick = 0;
       while (!signal.aborted) {
         try {
           await sweepNotifications();
+          // Every third pass (a minute): the replies and stall checks, which
+          // each cost one Tasks call per active card.
+          if (tick % 3 === 0) {
+            await sweepActivity();
+            await sweepStalled();
+          }
         } catch (error) {
           bb.log.error(`notification sweep failed: ${String(error)}`);
         }
+        tick += 1;
         await sleep(20_000, signal);
       }
     },
@@ -1493,6 +1658,14 @@ export default async function plugin(bb: BbPluginApi) {
     low: 2,
   };
 
+  /** Null when stall flagging is switched off. */
+  async function stallThresholdMs(): Promise<number | null> {
+    const raw = (await settings.get()).stallHours;
+    if (raw === "off") return null;
+    const hours = Number(raw);
+    return Number.isFinite(hours) && hours > 0 ? hours * 3_600_000 : null;
+  }
+
   function archivedCardIds(): Set<string> {
     return new Set(
       db
@@ -1614,6 +1787,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const archived = archivedCardIds();
+    const taskTouched = new Map<string, number>();
     const cards: BoardCard[] = [];
     const claimedTaskIds = new Set<string>();
     const claimedQuestionIds = new Set<string>();
@@ -1625,6 +1799,9 @@ export default async function plugin(bb: BbPluginApi) {
       const question = row.task_key !== null ? questions.get(row.task_key) ?? null : null;
       if (question !== undefined && question !== null) {
         claimedQuestionIds.add(question.id);
+      }
+      if (task !== null) {
+        taskTouched.set(row.id, parseTimestamp(task.updatedAt));
       }
       const lane = laneForRequest(row, task, question);
       if (
@@ -1655,6 +1832,8 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: pendingComments(row.id).length,
         workers: [],
         question,
+        stalled: false,
+        lastActivityAt: null,
         pullRequests: [],
         pullRequestsUnavailable: false,
         movable: true,
@@ -1668,6 +1847,7 @@ export default async function plugin(bb: BbPluginApi) {
       if (claimedTaskIds.has(task.id) || archived.has(task.id)) continue;
       const question = questions.get(task.key) ?? null;
       if (question !== null) claimedQuestionIds.add(question.id);
+      taskTouched.set(task.id, parseTimestamp(task.updatedAt));
       const lane = laneForTask(task, question);
       if (
         lane === "done" &&
@@ -1698,6 +1878,8 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: 0,
         workers: [],
         question,
+        stalled: false,
+        lastActivityAt: null,
         pullRequests: [],
         pullRequestsUnavailable: false,
         movable: true,
@@ -1733,11 +1915,45 @@ export default async function plugin(bb: BbPluginApi) {
         commentCount: 0,
         workers: [],
         question: item,
+        stalled: false,
+        lastActivityAt: null,
         pullRequests: [],
         pullRequestsUnavailable: false,
         movable: false,
         dispatchOnAdvance: false,
       });
+    }
+
+    // A card claiming to be in progress with nothing said for hours is not
+    // progressing. Surface it where the Captain looks, rather than letting it
+    // rot in a lane that says someone is on it.
+    const stallMs = await stallThresholdMs();
+    const activity = new Map<string, number>();
+    for (const row of db
+      .prepare<[], { card_id: string; last_comment_at: number | null }>(
+        `SELECT card_id, last_comment_at FROM notify_state
+           WHERE last_comment_at IS NOT NULL`,
+      )
+      .all()) {
+      if (row.last_comment_at !== null) {
+        activity.set(row.card_id, row.last_comment_at);
+      }
+    }
+    const now = Date.now();
+    for (const card of cards) {
+      const input = {
+        isInProgress: card.lane === "in_progress",
+        lastCommentAt: activity.get(card.id) ?? null,
+        taskUpdatedAt: taskTouched.get(card.id) ?? null,
+        createdAt: card.createdAt,
+        now,
+        stallMs,
+      };
+      card.lastActivityAt = lastActivity(input);
+      if (isStalled(input)) {
+        card.stalled = true;
+        card.lane = "needs_you";
+      }
     }
 
     cards.sort(
@@ -1804,6 +2020,10 @@ export default async function plugin(bb: BbPluginApi) {
         ["-e", "on run argv", "-e", script, "-e", "end run", "--", title, subtitle, body],
         (error) => {
           if (error) bb.log.warn(`notification failed: ${String(error)}`);
+          // Logged on success too: a banner is invisible to everything except
+          // the person looking at the screen, so without this there is no way to
+          // tell "sent" from "silently blocked by macOS".
+          else bb.log.info(`notified: ${subtitle} — ${body.slice(0, 80)}`);
           resolve();
         },
       );
@@ -1984,9 +2204,11 @@ export default async function plugin(bb: BbPluginApi) {
         }
         dispatchedTo = result.threadId;
       } else if (lane === "queue") {
+        // Keep the outcome: it records what was delivered last time round, and
+        // a drag back to Queue is "more work needed", not "erase the history".
         db.prepare(
           `UPDATE requests
-             SET state = 'queued', queue_pos = ?, closed_at = NULL, outcome = NULL
+             SET state = 'queued', queue_pos = ?, closed_at = NULL
            WHERE id = ?`,
         ).run(nextQueuePos(), cardId);
         publish();
@@ -2185,7 +2407,7 @@ export default async function plugin(bb: BbPluginApi) {
       db.prepare(
         `UPDATE requests
            SET state = 'queued', queue_pos = ?, chief_thread_id = NULL,
-               dispatched_at = NULL, closed_at = NULL, outcome = NULL
+               dispatched_at = NULL, closed_at = NULL
          WHERE id = ?`,
       ).run(nextQueuePos(), id);
       publish();
@@ -2382,6 +2604,15 @@ export default async function plugin(bb: BbPluginApi) {
       ];
 
       return { card, comments, artifacts, error };
+    },
+    async stopThread({ threadId }) {
+      try {
+        await bb.sdk.threads.stop({ threadId });
+        bb.log.info(`stopped thread ${threadId} from the command center`);
+        return { ok: true, error: null };
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
     },
     async voiceStatus() {
       try {

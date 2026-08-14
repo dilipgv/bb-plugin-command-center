@@ -13,7 +13,6 @@
  */
 import * as React from "react";
 import {
-  Markdown,
   definePluginApp,
   useBbNavigate,
   useRealtime,
@@ -38,6 +37,14 @@ import { Input } from "@/components/ui/input";
 import { useShortcut } from "@/hooks/useShortcut";
 import { useVoiceCapture } from "@/hooks/useVoiceCapture";
 import { CardViewer } from "./CardViewer";
+import {
+  Chip,
+  HeardLine,
+  MicButton,
+  relative,
+  untilLabel,
+  type VoiceAvailability,
+} from "./card-parts";
 import { ChiefHeader, ChiefPanel } from "./chief/panel";
 import { mountNavBadge } from "./nav-badge";
 import type {
@@ -54,11 +61,6 @@ type VoiceCapture = ReturnType<typeof useVoiceCapture>;
 
 const PRIORITIES: Priority[] = ["low", "normal", "high"];
 
-interface VoiceAvailability {
-  enabled: boolean;
-  error: string | null;
-}
-
 /** Shortcuts live in plugin settings, so a missing value falls back silently. */
 function stringSetting(
   values: Record<string, string | boolean> | undefined,
@@ -74,131 +76,10 @@ function withShortcut(label: string, hint: string | null): string {
   return hint === null ? label : `${label} (${hint})`;
 }
 
-/**
- * The one control for every voice affordance: idle mic, live stop button, and
- * a spinner while the clip is being transcribed.
- */
-function MicButton({
-  capture,
-  availability,
-  label,
-}: {
-  capture: VoiceCapture;
-  availability: VoiceAvailability;
-  label: string;
-}) {
-  if (!capture.isSupported || !availability.enabled) return null;
 
-  const { isRecording, isTranscribing, toggle } = capture;
-  return (
-    <Button
-      size="sm"
-      variant={isRecording ? "destructive" : "ghost"}
-      disabled={isTranscribing}
-      aria-label={isRecording ? `Stop recording (${label})` : label}
-      aria-pressed={isRecording}
-      onClick={() => toggle()}
-    >
-      <Icon
-        name={isTranscribing ? "Spinner" : isRecording ? "Square" : "Mic"}
-        className={isTranscribing ? "animate-spin" : undefined}
-        aria-hidden="true"
-      />
-      {isRecording ? "Stop" : null}
-    </Button>
-  );
-}
 
-/** What the transcriber heard, so a mishearing is visible before it acts. */
-function HeardLine({
-  transcript,
-  understood,
-  hint,
-}: {
-  transcript: string;
-  understood?: string[];
-  hint?: string;
-}) {
-  return (
-    <div className="space-y-1 rounded-md border border-border/60 bg-background/40 px-2 py-1.5">
-      <p className="text-xs italic text-muted-foreground">“{transcript}”</p>
-      {understood !== undefined && understood.length > 0 ? (
-        <div className="flex flex-wrap gap-1">
-          {understood.map((entry) => (
-            <Chip key={entry} tone="accent">
-              {entry}
-            </Chip>
-          ))}
-        </div>
-      ) : null}
-      {hint !== undefined ? (
-        <p className="text-[10px] text-muted-foreground">{hint}</p>
-      ) : null}
-    </div>
-  );
-}
 
-/**
- * A comment body as bb renders chat messages — agents write real Markdown
- * (headings, tables, code fences), and a 10,000-character plan shown as
- * pre-wrapped text is unreadable, worse so on a phone.
- *
- * Long bodies collapse by default so a card with five comments stays scannable
- * and you expand only the one you came for.
- */
-function CommentBody({ body }: { body: string }) {
-  const isLong = body.length > 700 || body.split("\n").length > 12;
-  const [isExpanded, setExpanded] = React.useState(false);
-  const isCollapsed = isLong && !isExpanded;
 
-  return (
-    <div className="min-w-0 space-y-1">
-      <div
-        className={
-          isCollapsed ? "relative max-h-40 overflow-hidden" : undefined
-        }
-      >
-        {/* Wide tables and code fences scroll rather than stretch the card. */}
-        <div className="min-w-0 overflow-x-auto">
-          <Markdown content={body} />
-        </div>
-        {isCollapsed ? (
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-background to-transparent" />
-        ) : null}
-      </div>
-      {isLong ? (
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => setExpanded((current) => !current)}
-        >
-          {isExpanded
-            ? "Show less"
-            : `Show more · ${Math.max(1, Math.round(body.length / 1000))}k chars`}
-        </Button>
-      ) : null}
-    </div>
-  );
-}
-
-function relative(ms: number): string {
-  const seconds = Math.round((Date.now() - ms) / 1000);
-  if (seconds < 60) return "just now";
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  return `${Math.round(hours / 24)}d ago`;
-}
-
-function untilLabel(ms: number): string {
-  const minutes = Math.round((ms - Date.now()) / 60_000);
-  if (minutes <= 0) return "due";
-  if (minutes < 60) return `in ${minutes}m`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `in ${hours}h`;
-  return `in ${Math.round(hours / 24)}d`;
-}
 
 /** One shared read of the board plus the question queue behind it. */
 function useCommandCenter(rpc: Rpc) {
@@ -261,27 +142,6 @@ function useCommandCenter(rpc: Rpc) {
 
 // ------------------------------------------------------------------ chrome
 
-function Chip({
-  children,
-  tone = "muted",
-}: {
-  children: React.ReactNode;
-  tone?: "muted" | "urgent" | "accent";
-}) {
-  const toneClass =
-    tone === "urgent"
-      ? "border-destructive/40 text-destructive"
-      : tone === "accent"
-        ? "border-border text-foreground"
-        : "border-border text-muted-foreground";
-  return (
-    <span
-      className={`rounded border px-1.5 py-0.5 text-[10px] leading-none ${toneClass}`}
-    >
-      {children}
-    </span>
-  );
-}
 
 // ---------------------------------------------------------------- composer
 
@@ -545,263 +405,6 @@ function Composer({
 
 // ------------------------------------------------------------------- items
 
-function ItemCard({
-  item,
-  rpc,
-  voice,
-  onNavigate,
-}: {
-  item: InboxItem;
-  rpc: Rpc;
-  voice: VoiceAvailability;
-  onNavigate: (threadId: string) => void;
-}) {
-  const [text, setText] = React.useState("");
-  const [checked, setChecked] = React.useState<string[]>([]);
-  const [busy, setBusy] = React.useState(false);
-  const [heard, setHeard] = React.useState<{
-    transcript: string;
-    hint: string;
-  } | null>(null);
-  /** A spoken option waits for one confirming tap rather than self-sending. */
-  const [pendingOption, setPendingOption] = React.useState<string | null>(null);
-
-  const hasOptions = item.options.length > 0;
-  const takesText =
-    item.kind === "text" || item.kind === "review" || !hasOptions;
-
-  const capture = useVoiceCapture({
-    onClip: async (clip) => {
-      const result = await rpc.call("voiceAnswer", {
-        audioBase64: clip.base64,
-        mimeType: clip.mimeType,
-        filename: clip.filename,
-        itemId: item.id,
-      });
-
-      if (item.kind === "multi" && result.options.length > 0) {
-        setChecked(result.options);
-        setHeard({
-          transcript: result.transcript,
-          hint: `Selected ${result.options.length}. Press Send to confirm.`,
-        });
-        return;
-      }
-      if (hasOptions && result.option !== null) {
-        setPendingOption(result.option);
-        setHeard({
-          transcript: result.transcript,
-          hint: `Matched “${result.option}” — press it to confirm.`,
-        });
-        return;
-      }
-      if (takesText) {
-        setText(result.transcript);
-        setHeard({
-          transcript: result.transcript,
-          hint: "Press Send to answer.",
-        });
-        return;
-      }
-      setHeard({
-        transcript: result.transcript,
-        hint: "That did not match any option — pick one below.",
-      });
-    },
-    onError: (message) => toast.error(message),
-  });
-
-  const resolve = async (answer: string) => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await rpc.call("answer", { id: item.id, answer });
-      toast.success("Answered");
-    } catch (error) {
-      toast.error(String(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const snooze = async (hours: number) => {
-    try {
-      await rpc.call("snooze", {
-        id: item.id,
-        untilMs: Date.now() + hours * 3_600_000,
-      });
-    } catch (error) {
-      toast.error(String(error));
-    }
-  };
-
-  return (
-    <article className="space-y-2 rounded-lg border border-border bg-card p-3">
-      <div className="flex flex-wrap items-center gap-1.5">
-        {item.urgent ? <Chip tone="urgent">urgent</Chip> : null}
-        {item.task !== "" ? <Chip tone="accent">{item.task}</Chip> : null}
-        {item.taskKey !== null ? <Chip>{item.taskKey}</Chip> : null}
-        {item.askedBy !== null ? <Chip>{item.askedBy}</Chip> : null}
-        <span className="ml-auto text-[10px] text-muted-foreground">
-          {relative(item.createdAt)}
-        </span>
-        <MicButton
-          capture={capture}
-          availability={voice}
-          label="Answer by voice"
-        />
-      </div>
-
-      <p className="text-sm text-foreground">{item.question}</p>
-
-      {heard !== null ? (
-        <HeardLine transcript={heard.transcript} hint={heard.hint} />
-      ) : null}
-
-      {item.priorAnswer !== null ? (
-        <p className="text-xs text-destructive">
-          Withdrawn answer: {item.priorAnswer}
-        </p>
-      ) : null}
-
-      {item.reviewThreadId !== null || item.reviewUrl !== null ? (
-        <div className="flex gap-2">
-          {item.reviewThreadId !== null ? (
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => onNavigate(item.reviewThreadId!)}
-            >
-              Open thread
-            </Button>
-          ) : null}
-          {item.reviewUrl !== null ? (
-            <Button size="sm" variant="outline" asChild>
-              <a href={item.reviewUrl} target="_blank" rel="noreferrer">
-                Open link
-              </a>
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
-
-      {item.kind === "options" || item.kind === "review" ? (
-        <div className="flex flex-wrap gap-2">
-          {item.options.map((option) => (
-            <Button
-              key={option}
-              size="sm"
-              variant={pendingOption === option ? "default" : "outline"}
-              className={`h-auto max-w-full whitespace-normal py-1.5 text-left ${
-                pendingOption === option ? "ring-2 ring-ring" : ""
-              }`}
-              disabled={busy}
-              onClick={() => void resolve(option)}
-            >
-              {option}
-            </Button>
-          ))}
-          {item.kind === "review" ? (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={busy}
-              onClick={() => void resolve("Reviewed, no comments.")}
-            >
-              Reviewed
-            </Button>
-          ) : null}
-        </div>
-      ) : null}
-
-      {item.kind === "multi" ? (
-        <div className="space-y-1">
-          {item.options.map((option) => (
-            <label
-              key={option}
-              className="flex items-center gap-2 text-sm text-foreground"
-            >
-              <input
-                type="checkbox"
-                checked={checked.includes(option)}
-                onChange={(event) =>
-                  setChecked((current) =>
-                    event.target.checked
-                      ? [...current, option]
-                      : current.filter((entry) => entry !== option),
-                  )
-                }
-              />
-              {option}
-            </label>
-          ))}
-          <Button
-            size="sm"
-            disabled={busy || checked.length === 0}
-            onClick={() => void resolve(checked.join(", "))}
-          >
-            Send {checked.length > 0 ? `(${checked.length})` : ""}
-          </Button>
-        </div>
-      ) : null}
-
-      {item.kind === "text" || item.kind === "review" ? (
-        <div className="flex gap-2">
-          <Input
-            value={text}
-            placeholder={item.placeholder ?? "Your answer"}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && text.trim() !== "") {
-                event.preventDefault();
-                void resolve(text.trim());
-              }
-            }}
-          />
-          <Button
-            size="sm"
-            disabled={busy || text.trim() === ""}
-            onClick={() => void resolve(text.trim())}
-          >
-            Send
-          </Button>
-        </div>
-      ) : null}
-
-      {item.kind === "ack" ? (
-        <Button size="sm" disabled={busy} onClick={() => void resolve("Acknowledged.")}>
-          Got it
-        </Button>
-      ) : null}
-
-      <div className="flex flex-wrap items-center gap-2 pt-1">
-        <Button size="sm" variant="ghost" onClick={() => void snooze(1)}>
-          Snooze 1h
-        </Button>
-        <Button size="sm" variant="ghost" onClick={() => void snooze(4)}>
-          4h
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={() => void rpc.call("dismiss", { id: item.id })}
-        >
-          Dismiss
-        </Button>
-        {item.threadId !== null ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="ml-auto"
-            onClick={() => onNavigate(item.threadId!)}
-          >
-            Who asked
-          </Button>
-        ) : null}
-      </div>
-    </article>
-  );
-}
 
 // ------------------------------------------------------------------- board
 
@@ -843,262 +446,18 @@ function workerTone(liveStatus: string | null): string {
   }
 }
 
-/** Comments and context for one card, including answering its question. */
-function CardDetail({
-  card,
-  rpc,
-  voice,
-  onClose,
-  onNavigate,
-  onMove,
-}: {
-  card: BoardCard;
-  rpc: Rpc;
-  voice: VoiceAvailability;
-  onClose: () => void;
-  onNavigate: (threadId: string) => void;
-  onMove: (card: BoardCard, lane: BoardLane) => void;
-}) {
-  const [comments, setComments] = React.useState<
-    {
-      id: string;
-      body: string;
-      authorName: string;
-      kind: string;
-      threadId: string | null;
-      threadTitle: string | null;
-      createdAt: string;
-      notifiedCount: number;
-      pending: boolean;
-    }[]
-  >([]);
-  const [canNotify, setCanNotify] = React.useState(false);
-  const [draft, setDraft] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const [loaded, setLoaded] = React.useState(false);
-
-  const load = React.useCallback(async () => {
-    try {
-      const result = await rpc.call("cardComments", { cardId: card.id });
-      setComments(result.comments);
-      setCanNotify(result.canNotify);
-      if (result.error !== null) toast.error(result.error);
-    } catch (error) {
-      toast.error(String(error));
-    } finally {
-      setLoaded(true);
-    }
-  }, [card.id, rpc]);
-
-  React.useEffect(() => {
-    void load();
-  }, [load]);
-
-  const submit = async () => {
-    const body = draft.trim();
-    if (body === "" || busy) return;
-    setBusy(true);
-    try {
-      const result = await rpc.call("addCardComment", {
-        cardId: card.id,
-        body,
-      });
-      if (!result.ok) {
-        toast.error(result.error ?? "Comment failed");
-        return;
-      }
-      setDraft("");
-      toast.success(
-        result.pending
-          ? "Saved — it reaches the worker once Chief creates the task."
-          : result.notified > 0
-            ? `Sent to ${result.notified} working thread${result.notified === 1 ? "" : "s"}.`
-            : "Added to the task.",
-      );
-      await load();
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <DialogContent className="min-h-0 max-w-3xl">
-      <DialogHeader>
-        <DialogTitle>{card.title}</DialogTitle>
-        <DialogDescription>
-          {[
-            card.taskKey,
-            card.projectName,
-            card.taskStatus,
-            LANE_TITLES[card.lane],
-          ]
-            .filter((part): part is string => part !== null && part !== "")
-            .join(" · ")}
-        </DialogDescription>
-      </DialogHeader>
-
-      <div className="min-w-0 space-y-4 md:max-h-[70vh] md:overflow-y-auto">
-        {card.body.trim() !== "" ? (
-          <CommentBody body={card.body} />
-        ) : null}
-
-        {card.outcome !== null ? (
-          <section className="space-y-1">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Outcome
-            </h3>
-            <CommentBody body={card.outcome} />
-          </section>
-        ) : null}
-
-        {card.question !== null ? (
-          <ItemCard
-            item={card.question}
-            rpc={rpc}
-            voice={voice}
-            onNavigate={onNavigate}
-          />
-        ) : null}
-
-        {card.workers.length > 0 ? (
-          <section className="space-y-1">
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Working on it
-            </h3>
-            {card.workers.map((worker) => (
-              <button
-                key={worker.threadId}
-                type="button"
-                className="flex w-full items-center gap-2 rounded-md border border-border px-2 py-1.5 text-left hover:bg-state-hover"
-                onClick={() => onNavigate(worker.threadId)}
-              >
-                <span className="truncate text-sm text-foreground">
-                  {worker.title ?? worker.threadId}
-                </span>
-                <span
-                  className={`ml-auto shrink-0 text-[10px] ${workerTone(worker.liveStatus)}`}
-                >
-                  {worker.liveStatus ?? "idle"}
-                </span>
-              </button>
-            ))}
-          </section>
-        ) : null}
-
-        <section className="space-y-2">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Comments
-          </h3>
-
-          <div className="flex gap-2">
-            <Input
-              autoFocus
-              value={draft}
-              placeholder={
-                canNotify
-                  ? "Add context — the worker gets it immediately"
-                  : "Add context — delivered once this has a task"
-              }
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  void submit();
-                }
-              }}
-            />
-            <Button
-              size="sm"
-              disabled={busy || draft.trim() === ""}
-              onClick={() => void submit()}
-            >
-              Send
-            </Button>
-          </div>
-
-          {!loaded ? (
-            <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : comments.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No comments yet. Anything you add here reaches whoever is working
-              this.
-            </p>
-          ) : (
-            <div className="space-y-2">
-              {comments.map((comment) => (
-                <article
-                  key={comment.id}
-                  className="space-y-1 rounded-md border border-border px-2 py-1.5"
-                >
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="text-xs font-medium text-foreground">
-                      {comment.authorName}
-                    </span>
-                    {comment.threadTitle !== null ? (
-                      <Chip>{comment.threadTitle}</Chip>
-                    ) : null}
-                    {comment.pending ? <Chip tone="urgent">pending</Chip> : null}
-                    {comment.notifiedCount > 0 ? (
-                      <Chip>sent to {comment.notifiedCount}</Chip>
-                    ) : null}
-                    <span className="ml-auto text-[10px] text-muted-foreground">
-                      {relative(Date.parse(comment.createdAt))}
-                    </span>
-                  </div>
-                  <CommentBody body={comment.body} />
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
-      </div>
-
-      <DialogFooter>
-        <div className="mr-auto flex flex-wrap gap-1">
-          {card.movable
-            ? DROPPABLE_LANES.filter((lane) => lane !== card.lane).map((lane) => (
-                <Button
-                  key={lane}
-                  size="sm"
-                  variant="outline"
-                  onClick={() => onMove(card, lane)}
-                >
-                  → {LANE_TITLES[lane]}
-                </Button>
-              ))
-            : null}
-        </div>
-        {card.chiefThreadId !== null ? (
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => onNavigate(card.chiefThreadId!)}
-          >
-            Open Chief
-          </Button>
-        ) : null}
-        <Button size="sm" variant="ghost" onClick={onClose}>
-          Close
-        </Button>
-      </DialogFooter>
-    </DialogContent>
-  );
-}
-
 /** Longest option label a lane-width button can show without truncating. */
 const QUICK_ANSWER_MAX_LABEL = 24;
 
 function BoardCardTile({
   card,
   rpc,
-  onOpen,
   onRead,
   onArchive,
   onDragStart,
 }: {
   card: BoardCard;
   rpc: Rpc;
-  onOpen: (card: BoardCard) => void;
   onRead: (card: BoardCard) => void;
   onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
@@ -1133,6 +492,7 @@ function BoardCardTile({
       </button>
 
       <div className="flex flex-wrap items-center gap-1">
+        {card.stalled ? <Chip tone="urgent">stalled</Chip> : null}
         {card.urgent ? <Chip tone="urgent">urgent</Chip> : null}
         {card.priority !== "normal" ? <Chip>{card.priority}</Chip> : null}
         {card.taskKey !== null ? <Chip tone="accent">{card.taskKey}</Chip> : null}
@@ -1166,6 +526,22 @@ function BoardCardTile({
         </button>
       </div>
 
+      {question === null && card.stalled ? (
+        <div className="space-y-1.5 border-t border-border/60 pt-1.5">
+          <p className="text-xs text-muted-foreground">
+            Went quiet while in progress. Nobody has said why.
+          </p>
+          <Button
+            size="sm"
+            variant="outline"
+            className="max-w-full"
+            onClick={() => onRead(card)}
+          >
+            Look at it
+          </Button>
+        </div>
+      ) : null}
+
       {question !== null ? (
         <div className="space-y-1.5 border-t border-border/60 pt-1.5">
           <p className="line-clamp-4 text-xs text-muted-foreground">
@@ -1194,7 +570,7 @@ function BoardCardTile({
               size="sm"
               variant={canQuickAnswer ? "ghost" : "outline"}
               className="max-w-full"
-              onClick={() => onOpen(card)}
+              onClick={() => onRead(card)}
             >
               {canQuickAnswer && question.options.length > 3
                 ? "More…"
@@ -1214,7 +590,6 @@ function BoardColumn({
   cards,
   rpc,
   isCompact,
-  onOpen,
   onRead,
   onArchive,
   onDragStart,
@@ -1224,7 +599,6 @@ function BoardColumn({
   cards: BoardCard[];
   rpc: Rpc;
   isCompact: boolean;
-  onOpen: (card: BoardCard) => void;
   onRead: (card: BoardCard) => void;
   onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
@@ -1288,7 +662,6 @@ function BoardColumn({
             key={card.id}
             card={card}
             rpc={rpc}
-            onOpen={onOpen}
             onRead={onRead}
             onArchive={onArchive}
             onDragStart={onDragStart}
@@ -1337,7 +710,6 @@ function CommandCenter({ subPath }: { subPath: string }) {
   );
 
   const isCompact = useIsCompactViewport();
-  const [openCardId, setOpenCardId] = React.useState<string | null>(null);
   /** A drop that would dispatch to Chief waits here for confirmation. */
   const [pendingDispatch, setPendingDispatch] = React.useState<BoardCard | null>(
     null,
@@ -1417,11 +789,6 @@ function CommandCenter({ subPath }: { subPath: string }) {
     [applyMove, board.cards],
   );
 
-  const openCard =
-    openCardId === null
-      ? null
-      : board.cards.find((card) => card.id === openCardId) ?? null;
-
   // A card id in the route means "read this one" — the whole panel becomes the
   // document, rather than the board with something floating over it.
   const viewing = subPath.trim();
@@ -1430,6 +797,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
       <CardViewer
         cardId={viewing}
         rpc={rpc}
+        voice={voice}
         onBack={() => navigate.toPluginPanel("inbox")}
       />
     );
@@ -1481,7 +849,6 @@ function CommandCenter({ subPath }: { subPath: string }) {
                 cards={board.cards.filter((card) => card.lane === lane)}
                 rpc={rpc}
                 isCompact={isCompact}
-                onOpen={(card) => setOpenCardId(card.id)}
                 onRead={(card) => openViewer(card.id)}
                 onArchive={(card) => void archive(card.id)}
                 onDragStart={() => undefined}
@@ -1566,31 +933,6 @@ function CommandCenter({ subPath }: { subPath: string }) {
         ) : null}
         </div>
       </div>
-
-      <Dialog
-        open={openCard !== null}
-        onOpenChange={(open) => {
-          if (!open) setOpenCardId(null);
-        }}
-      >
-        {openCard !== null ? (
-          <CardDetail
-            card={openCard}
-            rpc={rpc}
-            voice={voice}
-            onClose={() => setOpenCardId(null)}
-            onNavigate={openThread}
-            onMove={(card, lane) => {
-              setOpenCardId(null);
-              if (lane === "in_progress" && card.dispatchOnAdvance) {
-                setPendingDispatch(card);
-                return;
-              }
-              void applyMove(card, lane);
-            }}
-          />
-        ) : null}
-      </Dialog>
 
       <Dialog
         open={pendingDispatch !== null}
