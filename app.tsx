@@ -145,14 +145,26 @@ function useCommandCenter(rpc: Rpc) {
 
 // ---------------------------------------------------------------- composer
 
+interface Harness {
+  id: string;
+  label: string;
+  models: { id: string; label: string }[];
+}
+
 function Composer({
   rpc,
   projects,
+  harnesses,
   voice,
   onAdded,
 }: {
   rpc: Rpc;
   projects: { id: string; name: string }[];
+  harnesses: {
+    list: Harness[];
+    defaultProviderId: string | null;
+    defaultModel: string | null;
+  };
   voice: VoiceAvailability;
   onAdded: () => void;
 }) {
@@ -163,6 +175,27 @@ function Composer({
   const [priority, setPriority] = React.useState<Priority>("normal");
   const [urgent, setUrgent] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
+  // The selector IS the default: whatever is showing is what the next request
+  // runs on, and changing it is remembered.
+  const [providerId, setProviderId] = React.useState("");
+  const [model, setModel] = React.useState("");
+
+  React.useEffect(() => {
+    setProviderId(harnesses.defaultProviderId ?? "");
+    setModel(harnesses.defaultModel ?? "");
+  }, [harnesses.defaultProviderId, harnesses.defaultModel]);
+
+  const models =
+    harnesses.list.find((harness) => harness.id === providerId)?.models ?? [];
+
+  const rememberDefault = (nextProvider: string, nextModel: string) => {
+    void rpc
+      .call("setDispatchDefault", {
+        providerId: nextProvider === "" ? null : nextProvider,
+        model: nextModel === "" ? null : nextModel,
+      })
+      .catch((error: unknown) => toast.error(String(error)));
+  };
   const [heard, setHeard] = React.useState<{
     transcript: string;
     understood: string[];
@@ -243,6 +276,8 @@ function Composer({
         projectId: projectId === "" ? null : projectId,
         priority,
         urgent,
+        providerId: providerId === "" ? null : providerId,
+        model: model === "" ? null : model,
       });
       if (dispatchNow) {
         const result = await rpc.call("dispatchRequest", { id });
@@ -353,6 +388,48 @@ function Composer({
             </option>
           ))}
         </select>
+        {harnesses.list.length > 0 ? (
+          <>
+            <select
+              value={providerId}
+              aria-label="Harness to run this on"
+              onChange={(event) => {
+                const next = event.target.value;
+                setProviderId(next);
+                // A model belongs to one harness; do not carry it across.
+                setModel("");
+                rememberDefault(next, "");
+              }}
+              className="h-7 rounded-md border border-input bg-transparent px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            >
+              <option value="">Default harness</option>
+              {harnesses.list.map((harness) => (
+                <option key={harness.id} value={harness.id}>
+                  {harness.label}
+                </option>
+              ))}
+            </select>
+            {models.length > 0 ? (
+              <select
+                value={model}
+                aria-label="Model for that harness"
+                onChange={(event) => {
+                  const next = event.target.value;
+                  setModel(next);
+                  rememberDefault(providerId, next);
+                }}
+                className="h-7 max-w-[11rem] rounded-md border border-input bg-transparent px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <option value="">Harness default model</option>
+                {models.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.label}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+          </>
+        ) : null}
         <Button
           size="sm"
           variant="ghost"
@@ -684,6 +761,11 @@ function CommandCenter({ subPath }: { subPath: string }) {
   const [archived, setArchived] = React.useState<
     { cardId: string; archivedAt: number; title: string | null; taskKey: string | null }[]
   >([]);
+  const [harnesses, setHarnesses] = React.useState<{
+    list: Harness[];
+    defaultProviderId: string | null;
+    defaultModel: string | null;
+  }>({ list: [], defaultProviderId: null, defaultModel: null });
   const [voice, setVoice] = React.useState<VoiceAvailability>({
     enabled: false,
     error: null,
@@ -694,6 +776,23 @@ function CommandCenter({ subPath }: { subPath: string }) {
       .call("projects")
       .then((result) => setProjects(result.projects))
       .catch(() => setProjects([]));
+    void rpc
+      .call("harnesses")
+      .then((result) => {
+        setHarnesses({
+          list: result.harnesses,
+          defaultProviderId: result.defaultProviderId,
+          defaultModel: result.defaultModel,
+        });
+        if (result.error !== null) toast.error(result.error);
+      })
+      .catch(() =>
+        setHarnesses({
+          list: [],
+          defaultProviderId: null,
+          defaultModel: null,
+        }),
+      );
     void rpc
       .call("voiceStatus")
       .then(setVoice)
@@ -810,6 +909,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
           <Composer
             rpc={rpc}
             projects={projects}
+            harnesses={harnesses}
             voice={voice}
             onAdded={refresh}
           />

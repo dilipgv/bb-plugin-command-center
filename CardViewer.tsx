@@ -314,6 +314,12 @@ export function CardViewer({
               <span className="text-destructive">· urgent</span>
             ) : null}
             {card.priority !== "normal" ? <span>· {card.priority}</span> : null}
+            {card.providerId !== null ? (
+              <span title="Harness and model this work runs on">
+                · {card.providerId}
+                {card.model !== null ? ` / ${card.model}` : ""}
+              </span>
+            ) : null}
           </div>
 
           <h1 className="text-xl font-semibold leading-tight text-foreground">

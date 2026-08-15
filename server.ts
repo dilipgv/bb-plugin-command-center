@@ -98,6 +98,12 @@ const requestDto = z.object({
   blockedBy: z.string().nullable(),
 });
 
+const harnessDto = z.object({
+  id: z.string(),
+  label: z.string(),
+  models: z.array(z.object({ id: z.string(), label: z.string() })),
+});
+
 export type InboxItem = z.infer<typeof itemDto>;
 export type InboxRequest = z.infer<typeof requestDto>;
 
@@ -194,6 +200,9 @@ const boardCardDto = z.object({
    * no PR at all — a bad failure mode for a lane about reviewing them.
    */
   pullRequestsUnavailable: z.boolean(),
+  /** The harness and model this work was dispatched to run on, when chosen. */
+  providerId: z.string().nullable(),
+  model: z.string().nullable(),
   /** False for cards this panel may not move (bare questions). */
   movable: z.boolean(),
   /** True when moving out of Queue would dispatch work to Chief. */
@@ -263,6 +272,8 @@ export const rpcContract = defineRpcContract({
         projectId: z.string().nullish(),
         priority: z.enum(PRIORITIES).optional(),
         urgent: z.boolean().optional(),
+        providerId: z.string().nullish(),
+        model: z.string().nullish(),
       })
       .strict(),
     output: z.object({ id: z.string() }),
@@ -363,6 +374,29 @@ export const rpcContract = defineRpcContract({
    * The sidebar badge's number. Deliberately one cheap COUNT: the nav badge
    * polls it, and the board's own rpc is far too heavy for that.
    */
+  /**
+   * The harnesses (providers) and models work can be dispatched onto, plus the
+   * remembered default. Models come from the host per provider, so this is
+   * cached briefly rather than fetched on every keystroke.
+   */
+  harnesses: {
+    input: z.null(),
+    output: z.object({
+      harnesses: z.array(harnessDto),
+      defaultProviderId: z.string().nullable(),
+      defaultModel: z.string().nullable(),
+      error: z.string().nullable(),
+    }),
+  },
+  setDispatchDefault: {
+    input: z
+      .object({
+        providerId: z.string().nullish(),
+        model: z.string().nullish(),
+      })
+      .strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
   attention: {
     input: z.null(),
     output: z.object({ needsYou: z.number() }),
@@ -511,6 +545,8 @@ interface RequestRow {
   dispatched_at: number | null;
   closed_at: number | null;
   outcome: string | null;
+  provider_id: string | null;
+  model: string | null;
 }
 
 const MAX_DELIVERY_ATTEMPTS = 20;
@@ -743,6 +779,9 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE notify_state ADD COLUMN last_comment_at INTEGER`,
     `ALTER TABLE notify_state ADD COLUMN last_comment_id TEXT`,
     `ALTER TABLE notify_state ADD COLUMN stalled_notified_at INTEGER`,
+    // Which harness and model the Captain wants this work run on.
+    `ALTER TABLE requests ADD COLUMN provider_id TEXT`,
+    `ALTER TABLE requests ADD COLUMN model TEXT`,
   ]);
 
   function publish(): void {
@@ -753,6 +792,7 @@ export default async function plugin(bb: BbPluginApi) {
   // shared database. It used to read the Inbox over cross-plugin rpc; now that
   // both halves are one plugin, it just gets a function.
   const chief = await registerChief(bb, db, {
+    dispatchPreference: (taskKey) => dispatchPreferenceFor(taskKey),
     openQuestions: (): ChiefNavNeedsInput[] =>
       listItems().open.map((item) => ({
         id: item.id,
@@ -1222,12 +1262,15 @@ export default async function plugin(bb: BbPluginApi) {
     projectId?: string | null;
     priority?: (typeof PRIORITIES)[number];
     urgent?: boolean;
+    providerId?: string | null;
+    model?: string | null;
   }): string {
     const id = newId("cc");
     db.prepare(
       `INSERT INTO requests (
-         id, created_at, title, body, project_id, priority, urgent, state, queue_pos
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)`,
+         id, created_at, title, body, project_id, priority, urgent, state,
+         queue_pos, provider_id, model
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
     ).run(
       id,
       Date.now(),
@@ -1237,6 +1280,8 @@ export default async function plugin(bb: BbPluginApi) {
       coercePriority(input.priority),
       input.urgent === true ? 1 : 0,
       nextQueuePos(),
+      input.providerId ?? null,
+      input.model ?? null,
     );
     publish();
     return id;
@@ -1315,12 +1360,21 @@ export default async function plugin(bb: BbPluginApi) {
     ]
       .filter((part): part is string => part !== null && part !== undefined)
       .join(" · ");
+    const harness = [
+      row.provider_id !== null ? `harness ${row.provider_id}` : null,
+      row.model !== null ? `model ${row.model}` : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(", ");
     return [
       `COMMAND CENTER REQUEST ${row.id} · ${scope}`,
       "",
       row.title,
       ...(row.body.trim() !== "" ? ["", row.body.trim()] : []),
       "",
+      harness !== ""
+        ? `Run it on: ${harness}. Pass these to chief_handoff; it defaults to them anyway.`
+        : "",
       "Route this: decide which project owns it, make sure that project has a chief, and send it down. Do not do the work yourself.",
       `Ack it as soon as a task exists: \`bb inbox ack ${row.id} --task-key <key>\`.`,
       `Close it when it lands or is abandoned: \`bb inbox close ${row.id} --outcome "…"\`.`,
@@ -1830,6 +1884,8 @@ export default async function plugin(bb: BbPluginApi) {
         outcome: row.outcome,
         createdAt: row.created_at,
         commentCount: pendingComments(row.id).length,
+        providerId: row.provider_id,
+        model: row.model,
         workers: [],
         question,
         stalled: false,
@@ -1876,6 +1932,8 @@ export default async function plugin(bb: BbPluginApi) {
         outcome: null,
         createdAt: parseTimestamp(task.createdAt),
         commentCount: 0,
+        providerId: null,
+        model: null,
         workers: [],
         question,
         stalled: false,
@@ -1913,6 +1971,8 @@ export default async function plugin(bb: BbPluginApi) {
         outcome: null,
         createdAt: item.createdAt,
         commentCount: 0,
+        providerId: null,
+        model: null,
         workers: [],
         question: item,
         stalled: false,
@@ -2264,6 +2324,106 @@ export default async function plugin(bb: BbPluginApi) {
     publish();
   }
 
+  // ------------------------------------------------------------- harnesses
+
+  /** A provider id is a slug; make it read like a name. */
+  function harnessLabel(providerId: string): string {
+    return providerId
+      .split(/[-_]/u)
+      .map((part) =>
+        part === "acp" || part === "cli"
+          ? part.toUpperCase()
+          : part.charAt(0).toUpperCase() + part.slice(1),
+      )
+      .join(" ");
+  }
+
+  const HARNESS_CACHE_MS = 60_000;
+  let harnessCache: {
+    at: number;
+    harnesses: z.infer<typeof harnessDto>[];
+    error: string | null;
+  } | null = null;
+
+  async function listHarnesses(): Promise<{
+    harnesses: z.infer<typeof harnessDto>[];
+    error: string | null;
+  }> {
+    if (harnessCache !== null && Date.now() - harnessCache.at < HARNESS_CACHE_MS) {
+      return { harnesses: harnessCache.harnesses, error: harnessCache.error };
+    }
+    try {
+      const providers = await bb.sdk.providers.list();
+      const available = providers.filter((provider) => provider.available);
+      const harnesses = await Promise.all(
+        available.map(async (provider) => {
+          let models: { id: string; label: string }[] = [];
+          try {
+            const options = await bb.sdk.providers.models({
+              providerId: provider.id,
+            });
+            models = options.models.map((model) => ({
+              id: model.id,
+              label: model.displayName !== "" ? model.displayName : model.id,
+            }));
+          } catch {
+            // A provider whose models cannot be listed is still selectable;
+            // omitting the model means "whatever that harness defaults to".
+          }
+          return {
+            id: provider.id,
+            label: harnessLabel(provider.id),
+            models,
+          };
+        }),
+      );
+      harnessCache = { at: Date.now(), harnesses, error: null };
+      return { harnesses, error: null };
+    } catch (error) {
+      const message = `Could not read the provider list: ${String(error)}`;
+      harnessCache = { at: Date.now(), harnesses: [], error: message };
+      return { harnesses: [], error: message };
+    }
+  }
+
+  interface DispatchDefault {
+    providerId: string | null;
+    model: string | null;
+  }
+
+  async function dispatchDefault(): Promise<DispatchDefault> {
+    const stored = await bb.storage.kv.get<DispatchDefault>("dispatch-default");
+    return {
+      providerId: stored?.providerId ?? null,
+      model: stored?.model ?? null,
+    };
+  }
+
+  /**
+   * What harness and model this task should run on: the card's own choice first,
+   * then the remembered default. Chief reads this when handing work off, so the
+   * Captain's pick is honoured even if Chief does not repeat it.
+   */
+  async function dispatchPreferenceFor(
+    taskKey: string | null,
+  ): Promise<DispatchDefault> {
+    if (taskKey !== null) {
+      const row = db
+        .prepare<[string], { provider_id: string | null; model: string | null }>(
+          `SELECT provider_id, model FROM requests WHERE task_key = ?
+             ORDER BY created_at DESC LIMIT 1`,
+        )
+        .get(taskKey);
+      if (row?.provider_id != null || row?.model != null) {
+        return {
+          providerId: row?.provider_id ?? null,
+          model: row?.model ?? null,
+        };
+      }
+    }
+    return await dispatchDefault();
+  }
+
   // ---------------------------------------------------------------- voice
 
   async function voiceProjects(): Promise<VoiceProject[]> {
@@ -2364,7 +2524,10 @@ export default async function plugin(bb: BbPluginApi) {
         chiefError: chief.error,
       };
     },
-    addRequest(input) {
+    async addRequest(input) {
+      // An unspecified harness falls back to the remembered default, so a card
+      // always records what it should run on.
+      const fallback = await dispatchDefault();
       return {
         id: addRequest({
           title: input.title,
@@ -2372,6 +2535,8 @@ export default async function plugin(bb: BbPluginApi) {
           projectId: input.projectId ?? null,
           priority: input.priority,
           urgent: input.urgent,
+          providerId: input.providerId ?? fallback.providerId,
+          model: input.model ?? fallback.model,
         }),
       };
     },
@@ -2486,6 +2651,26 @@ export default async function plugin(bb: BbPluginApi) {
       } catch (error) {
         return { ok: false, notified: 0, pending: false, error: String(error) };
       }
+    },
+    async harnesses() {
+      const [{ harnesses, error }, chosen] = await Promise.all([
+        listHarnesses(),
+        dispatchDefault(),
+      ]);
+      return {
+        harnesses,
+        defaultProviderId: chosen.providerId,
+        defaultModel: chosen.model,
+        error,
+      };
+    },
+    async setDispatchDefault({ providerId, model }) {
+      await bb.storage.kv.set("dispatch-default", {
+        providerId: providerId ?? null,
+        model: model ?? null,
+      });
+      publish();
+      return { ok: true };
     },
     attention() {
       const row = db

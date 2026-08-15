@@ -32,6 +32,14 @@ export type ChiefDatabase = ReturnType<BbPluginApi["storage"]["database"]>;
 export interface ChiefDeps {
   /** Open, non-snoozed questions shaped for the nav's needs-input rail. */
   openQuestions: () => ChiefNavNeedsInput[];
+  /**
+   * The harness and model the Captain picked for this task, or their default.
+   * Applied when a handoff does not name one, so their choice is honoured even
+   * if Chief forgets to pass it along.
+   */
+  dispatchPreference: (
+    taskKey: string | null,
+  ) => Promise<{ providerId: string | null; model: string | null }>;
 }
 
 /** Realtime channel — the frontend refetches `state` whenever this fires. */
@@ -212,6 +220,18 @@ const handoffParams = z.object({
     .array(z.string())
     .optional()
     .describe("Boundaries: what not to touch, required approach, invariants."),
+  providerId: z
+    .string()
+    .optional()
+    .describe(
+      "Harness to run the architect on (e.g. claude-code, codex). Omit to use whatever the Captain selected in the command center.",
+    ),
+  model: z
+    .string()
+    .optional()
+    .describe(
+      "Model for that harness. Omit to use the Captain's command centre selection.",
+    ),
   context: z
     .string()
     .optional()
@@ -595,9 +615,16 @@ export async function registerChief(
     const title = architectTitlePrefix
       ? `${params.taskKey} — ${params.title}`
       : params.title;
+    // The Captain chose a harness in the command center; honour it unless this
+    // handoff names one explicitly.
+    const preferred = await deps.dispatchPreference(params.taskKey);
+    const providerId = params.providerId ?? preferred.providerId;
+    const model = params.model ?? preferred.model;
     const thread = await bb.sdk.threads.spawn({
       projectId,
       title,
+      ...(providerId !== null ? { providerId } : {}),
+      ...(model !== null ? { model } : {}),
       // Same rule as project chiefs: the rail and the task are where these
       // live, so they never appear in the sidebar.
       ...(hideSubordinateThreads ? { visibility: "hidden" as const } : {}),
@@ -627,8 +654,12 @@ export async function registerChief(
       mission: params.mission,
       created_at: Date.now(),
     });
-    bb.log.info(`handed ${params.taskKey} to task architect ${thread.id}`);
-    return { threadId: thread.id, projectId, title };
+    bb.log.info(
+      `handed ${params.taskKey} to task architect ${thread.id}${
+        providerId !== null ? ` on ${providerId}` : ""
+      }`,
+    );
+    return { threadId: thread.id, projectId, title, providerId, model };
   }
 
   /** The whole org, with live thread status. Shared by rpc, tools, and cli. */
@@ -795,7 +826,11 @@ export async function registerChief(
     async execute(params, ctx) {
       const result = await handoff(params, ctx.threadId ?? null);
       return [
-        `Handed ${params.taskKey} to task architect thread ${result.threadId} ("${result.title}").`,
+        `Handed ${params.taskKey} to task architect thread ${result.threadId} ("${result.title}")${
+          result.providerId !== null
+            ? ` on ${result.providerId}${result.model !== null ? ` / ${result.model}` : ""}`
+            : ""
+        }.`,
         `Attach it to the task so the board reflects reality: \`bb tasks attach ${params.taskKey} --thread ${result.threadId}\`.`,
         "It reports back here; escalate only decisions and blockers upward.",
       ].join("\n");

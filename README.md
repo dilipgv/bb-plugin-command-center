@@ -20,6 +20,29 @@ Two lanes run in opposite directions through the board:
   routes it to the owning project chief, which creates the task and hands it to
   an architect. Requests are never dispatched automatically.
 
+## Harness and model
+
+The composer carries two selectors: which **harness** (provider) the work runs
+on, and which **model** of that harness. Both are optional — leaving them at
+"Default harness" lets BB choose as it always has.
+
+The selector *is* the default: whatever is showing is what the next request runs
+on, and changing it is remembered (in plugin kv, not a setting, because the
+harness list is discovered from the host and a `select` setting needs static
+options). Switching harness clears the model, since a model belongs to one
+harness.
+
+The choice is honoured in two places, deliberately belt-and-braces:
+
+1. The dispatch brief tells Chief which harness and model the Captain picked.
+2. `chief_handoff` takes optional `providerId`/`model`, and **when they are
+   omitted it falls back to the card's choice, then the remembered default** —
+   so the pick survives Chief forgetting to pass it on. The tool reports what it
+   actually spawned on.
+
+Discovery comes from `providers.list()` plus `providers.models({ providerId })`
+per provider, cached for a minute because each is a host round trip.
+
 ## The reading view
 
 Clicking a card's title opens it at `…/inbox/<cardId>` — a document, not a modal:
