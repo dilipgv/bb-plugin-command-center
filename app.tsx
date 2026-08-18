@@ -45,7 +45,6 @@ import {
   untilLabel,
   type VoiceAvailability,
 } from "./card-parts";
-import { ChiefHeader, ChiefPanel } from "./chief/panel";
 import { mountNavBadge } from "./nav-badge";
 import type {
   BoardCard,
@@ -1108,15 +1107,5 @@ export default definePluginApp((app) => {
     path: "inbox",
     component: CommandCenter,
     headerContent: CommandCenterHeader,
-  });
-  // Chief's org map keeps its own entry: the board is the work, this is who is
-  // working it. One plugin, two jobs.
-  app.slots.navPanel({
-    id: "chief",
-    title: "Chief",
-    icon: "Crown",
-    path: "chief",
-    component: ChiefPanel,
-    headerContent: ChiefHeader,
   });
 });

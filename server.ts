@@ -1,5 +1,5 @@
 /**
- * Command Center — the Captain's only surface, and the org behind it.
+ * Command Center — the Captain's only surface.
  *
  * Two lanes, opposite directions, one board:
  *
@@ -8,14 +8,13 @@
  *   requests you → the org. Work you queue and then dispatch to Chief, which
  *            demuxes it to the owning project chief and its architects.
  *
- * Chief itself lives in ./chief, merged in from the standalone chief-nav plugin.
- * It owns its own rpc, settings, tools and panel; this module owns the one
- * database (both halves share it), the one CLI command, and the dispatch path
- * between the queue and Chief's thread.
+ * Chief is a separate plugin (chief-nav). The two talk only over cross-plugin
+ * rpc: this module asks chief-nav where Chief's thread lives to dispatch a
+ * request, exposes `dispatchPreference` for chief-nav to read the harness/model
+ * choice back, and `list` for chief-nav's needs-input rail.
  *
- * The `items` schema predates the rebuild; migrations 0–11 reconstruct it
- * exactly so an existing data.db is adopted untouched. Append only at the end —
- * Chief's tables sit after the Inbox's for exactly that reason.
+ * The `items` schema predates a rebuild; migrations 0–11 reconstruct it exactly
+ * so an existing data.db is adopted untouched. Append only at the end.
  */
 import {
   defineRpcContract,
@@ -30,8 +29,6 @@ import { extractArtifacts, type Artifact } from "./lib/artifacts";
 import { previewMarkdown } from "./lib/markdown-preview";
 import { isStalled, lastActivity } from "./lib/stall";
 
-import { CHIEF_MIGRATIONS } from "./chief/migrations";
-import { registerChief, type ChiefNavNeedsInput } from "./chief/server";
 import {
   matchSpokenOption,
   matchSpokenOptions,
@@ -397,6 +394,17 @@ export const rpcContract = defineRpcContract({
       .strict(),
     output: z.object({ ok: z.boolean() }),
   },
+  /**
+   * The harness/model preference for one task, for Chief to read over
+   * cross-plugin rpc when handing work to an architect (see dispatchPreferenceFor).
+   */
+  dispatchPreference: {
+    input: z.object({ taskKey: z.string().nullable() }).strict(),
+    output: z.object({
+      providerId: z.string().nullable(),
+      model: z.string().nullable(),
+    }),
+  },
   attention: {
     input: z.null(),
     output: z.object({ needsYou: z.number() }),
@@ -757,7 +765,6 @@ export default async function plugin(bb: BbPluginApi) {
     // Chief's tables, appended when the two plugins merged. Both halves now
     // share one database, so its statements follow the Inbox's rather than
     // starting from index 0 in a file of their own.
-    ...CHIEF_MIGRATIONS,
     // What each card looked like when we last told the Captain about it.
     `CREATE TABLE IF NOT EXISTS notify_state (
        card_id TEXT PRIMARY KEY,
@@ -787,24 +794,6 @@ export default async function plugin(bb: BbPluginApi) {
   function publish(): void {
     bb.realtime.publish("changed", { at: Date.now() });
   }
-
-  // Chief registers its own rpc, settings, tools, events and panel against the
-  // shared database. It used to read the Inbox over cross-plugin rpc; now that
-  // both halves are one plugin, it just gets a function.
-  const chief = await registerChief(bb, db, {
-    dispatchPreference: (taskKey) => dispatchPreferenceFor(taskKey),
-    openQuestions: (): ChiefNavNeedsInput[] =>
-      listItems().open.map((item) => ({
-        id: item.id,
-        question: item.question,
-        task: item.task,
-        taskKey: item.taskKey,
-        askedBy: item.askedBy,
-        urgent: item.urgent,
-        reviewThreadId: item.reviewThreadId,
-        askerThreadId: item.threadId,
-      })),
-  });
 
   // ------------------------------------------------------------ item reads
 
@@ -1328,17 +1317,29 @@ export default async function plugin(bb: BbPluginApi) {
     status: string | null;
     error: string | null;
   }> {
-    // Chief's own registry, read in-process. The setting stays as an override
-    // for a Chief thread that was started outside this plugin.
-    const registered = chief.chiefThreadId();
-    if (registered !== null) {
-      let status: string | null = null;
-      try {
-        status = (await bb.sdk.threads.get({ threadId: registered })).status;
-      } catch {
-        status = null;
+    try {
+      const state = await bb.sdk.plugins.callRpc({
+        pluginId: "chief-nav",
+        method: "state",
+        input: null,
+        outputSchema: z.looseObject({
+          chief: z
+            .looseObject({
+              threadId: z.string(),
+              status: z.string().nullish(),
+            })
+            .nullable(),
+        }),
+      });
+      if (state.chief?.threadId !== undefined) {
+        return {
+          threadId: state.chief.threadId,
+          status: state.chief.status ?? null,
+          error: null,
+        };
       }
-      return { threadId: registered, status, error: null };
+    } catch (error) {
+      bb.log.debug(`chief-nav unavailable: ${String(error)}`);
     }
     const configured = (await settings.get()).chiefThreadId.trim();
     if (configured !== "") {
@@ -2672,6 +2673,9 @@ export default async function plugin(bb: BbPluginApi) {
       publish();
       return { ok: true };
     },
+    async dispatchPreference({ taskKey }) {
+      return await dispatchPreferenceFor(taskKey);
+    },
     attention() {
       const row = db
         .prepare<[number], { open: number }>(
@@ -2968,7 +2972,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.cli.register({
     name: "inbox",
     summary:
-      "Your command center: the queue, the questions, and the Chief org behind them",
+      "Your command center: the board, the queue, and the questions waiting on you",
     commands: [
       {
         name: "ask",
@@ -3055,18 +3059,6 @@ export default async function plugin(bb: BbPluginApi) {
         summary:
           "Show how a spoken phrase parses into a request, without a microphone",
         usage: 'bb inbox voice-parse "bump the SDK, high priority, dispatch" [--json]',
-      },
-      // Chief's whole surface under one entry: a plugin gets a single CLI
-      // command, and these names must be single tokens. Derived from Chief's
-      // own list so it cannot drift.
-      {
-        name: "chief",
-        summary: `The Chief org — ${chief.cli.commands
-          .map((command) => command.name)
-          .join(", ")}`,
-        usage: `bb inbox chief <${chief.cli.commands
-          .map((command) => command.name)
-          .join("|")}> [options]`,
       },
     ],
     async run(argv, ctx) {
@@ -3472,14 +3464,10 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
 
-        // Everything Chief used to answer as `bb chief …`.
-        case "chief":
-          return await chief.cli.run(rest, ctx);
-
         default:
           return {
             exitCode: 1,
-            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, notify-test, chief`,
+            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, notify-test`,
           };
       }
     },

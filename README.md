@@ -1,7 +1,9 @@
 # bb-plugin-command-center
 
-The Captain's command center, and the Chief org behind it — one plugin, merged
-from the former `inbox` and `chief-nav`.
+The Captain's command center: a board of everything in flight and the
+questions waiting on you. It dispatches work to Chief but does not own it —
+Chief is the separate `chief-nav` plugin, talked to only over cross-plugin rpc.
+(The two lived merged into one plugin for a while; they were split back apart.)
 
 The board runs Queue → In progress → In review → Done, with a derived Needs you
 lane. Moving a card into **Done is deliberately manual** — signing work off is
@@ -35,9 +37,10 @@ harness.
 The choice is honoured in two places, deliberately belt-and-braces:
 
 1. The dispatch brief tells Chief which harness and model the Captain picked.
-2. `chief_handoff` takes optional `providerId`/`model`, and **when they are
-   omitted it falls back to the card's choice, then the remembered default** —
-   so the pick survives Chief forgetting to pass it on. The tool reports what it
+2. `chief_handoff` (in chief-nav) takes optional `providerId`/`model`, and
+   **when they are omitted it falls back to the card's choice, then the
+   remembered default** — read from this plugin's `dispatchPreference` rpc — so
+   the pick survives Chief forgetting to pass it on. The tool reports what it
    actually spawned on.
 
 Discovery comes from `providers.list()` plus `providers.models({ providerId })`
@@ -197,43 +200,45 @@ Agents get the same surface through the bundled `user-inbox` skill.
 
 ## Chief
 
-`bb inbox chief …` is Chief's whole surface (`status`, `start`, `adopt`,
-`project-chief`, `adopt-project-chief`, `handoff`, `retire`, `tidy`). It lives
-under `bb inbox` because **a plugin may register only one top-level CLI
-command** — merging cost `bb chief` as a name, not as a capability. The agent
-tools (`chief_project_chief`, `chief_handoff`, `chief_roster`) and the three
-Chief skills are unchanged.
+Chief is the separate `chief-nav` plugin — its own panel, its own `bb chief`
+command, its own agent tools (`chief_project_chief`, `chief_handoff`,
+`chief_roster`) and its own database. This plugin never imports it; the two
+talk only over `bb.sdk.plugins.callRpc`:
 
-The Chief panel keeps its own nav entry: the board is the work, that panel is who
-is doing it.
+- Dispatching a request asks chief-nav's `state` rpc for the live Chief thread,
+  falling back to the `chiefThreadId` setting if chief-nav is not installed.
+- chief-nav's needs-input rail reads this plugin's `list` rpc.
+- chief-nav reads this plugin's `dispatchPreference` rpc to honour the
+  harness/model chosen in the composer when handing work to an architect.
+
+Each plugin stays useful with the other absent — a missing Chief surfaces as
+`chiefError` on the board rather than breaking it.
+
+(The two lived merged into one plugin for a while, sharing a database and CLI
+command; they were split back into separate plugins, restoring the original
+cross-plugin contract above.)
 
 ## Data
 
-> `~/.bb/plugins/inbox/` is **not live**. It is the pre-merge database from when
-> this plugin's id was `inbox`, left in place as a backup after the rename. The
-> live data is `~/.bb/plugins/command-center/data.db`. Delete the old directory
-> once you are confident nothing is missing.
+> `~/.bb/plugins/inbox/` is **not live**. It is a pre-rename backup, left in
+> place after this plugin's id changed from `inbox`. The live data is
+> `~/.bb/plugins/command-center/data.db`. Delete the old directory once you are
+> confident nothing is missing.
 
-`items` (questions), `requests` (the command center lane) and Chief's own
-`chief`/`project_chiefs`/`architects` tables share one SQLite at
-`<dataDir>/plugins/command-center/data.db`. The first twelve
-migrations reconstruct the `items` schema exactly as it shipped before the
-rebuild, and Chief's eight follow at 17–24 because both halves now share one
-file — **append new migrations only at the end, never edit or reorder a shipped
-one.**
+`items` (questions) and `requests` (the command center lane) live in one
+SQLite at `<dataDir>/plugins/command-center/data.db`. Migrations 0–11
+reconstruct the `items` schema exactly as it shipped originally — **append new
+migrations only at the end, never edit or reorder a shipped one.** Chief's own
+tables live in chief-nav's separate database.
 
 ## Layout
 
 - `server.ts` / `app.tsx` — the command center: board, queue, questions, voice.
-- `chief/` — the Chief org, merged in from `chief-nav`. It registers its own rpc,
-  settings, agent tools, events and panel; the host module owns the shared
-  database, the single CLI, and dispatching a request into Chief's thread.
-- `lib/`, `hooks/` — pure logic (voice grammar, shortcut parsing) and React
-  hooks, both unit-testable without a server.
-
-The two halves used to talk over cross-plugin rpc. They are now direct calls:
-Chief's needs-input rail reads the Inbox's open items through a callback, and the
-dispatcher reads Chief's thread from its own table.
+- `lib/`, `hooks/` — pure logic (voice grammar, shortcut parsing, artifact
+  extraction, stall detection) and React hooks, both unit-testable without a
+  server.
+- `card-parts.tsx` — the answering block (with voice, snooze, dismiss) shared
+  by the board and the reading view.
 
 ## Tasks
 

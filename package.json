@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-command-center",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
   "engines": {
     "bb": ">=0.37",
@@ -8,9 +8,9 @@
   },
   "bb": {
     "name": "Command Center",
-    "description": "The Captain's single surface: a board of everything in flight, the questions waiting on you, and the Chief org that works the queue.",
+    "description": "The Captain's single surface: a board of everything in flight and the questions waiting on you. Dispatches to Chief (a separate plugin) but does not own it.",
     "branding": {
-      "icon": "Crown"
+      "icon": "Mail"
     },
     "server": "./server.ts",
     "app": "./app.tsx",
