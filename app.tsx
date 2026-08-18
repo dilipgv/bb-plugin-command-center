@@ -154,12 +154,14 @@ interface Harness {
 function Composer({
   rpc,
   projects,
+  defaultProjectId,
   harnesses,
   voice,
   onAdded,
 }: {
   rpc: Rpc;
   projects: { id: string; name: string }[];
+  defaultProjectId: string | null;
   harnesses: {
     list: Harness[];
     defaultProviderId: string | null;
@@ -184,6 +186,12 @@ function Composer({
     setProviderId(harnesses.defaultProviderId ?? "");
     setModel(harnesses.defaultModel ?? "");
   }, [harnesses.defaultProviderId, harnesses.defaultModel]);
+
+  // The `defaultProject` setting starts the picker pre-selected; picking a
+  // different project for one request does not change the setting.
+  React.useEffect(() => {
+    setProjectId(defaultProjectId ?? "");
+  }, [defaultProjectId]);
 
   const models =
     harnesses.list.find((harness) => harness.id === providerId)?.models ?? [];
@@ -281,7 +289,7 @@ function Composer({
       });
       if (dispatchNow) {
         const result = await rpc.call("dispatchRequest", { id });
-        if (result.ok) toast.success("Dispatched to Chief");
+        if (result.ok) toast.success("Dispatched");
         else toast.error(result.error ?? "Dispatch failed");
       } else {
         toast.success("Queued");
@@ -346,7 +354,7 @@ function Composer({
         <textarea
           ref={bodyRef}
           value={body}
-          placeholder="Context, constraints, links — anything Chief should route with."
+          placeholder="Context, constraints, links — anything the routing should account for."
           rows={3}
           className="w-full rounded-md border border-input bg-transparent px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           onChange={(event) => setBody(event.target.value)}
@@ -370,7 +378,7 @@ function Composer({
           onChange={(event) => setProjectId(event.target.value)}
           className="h-7 rounded-md border border-input bg-transparent px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
         >
-          <option value="">Let Chief pick the project</option>
+          <option value="">Pick the project automatically</option>
           {projects.map((project) => (
             <option key={project.id} value={project.id}>
               {project.name}
@@ -774,6 +782,9 @@ function CommandCenter({ subPath }: { subPath: string }) {
   const [projects, setProjects] = React.useState<{ id: string; name: string }[]>(
     [],
   );
+  const [defaultProjectId, setDefaultProjectId] = React.useState<string | null>(
+    null,
+  );
   const [archived, setArchived] = React.useState<
     { cardId: string; archivedAt: number; title: string | null; taskKey: string | null }[]
   >([]);
@@ -790,7 +801,10 @@ function CommandCenter({ subPath }: { subPath: string }) {
   React.useEffect(() => {
     void rpc
       .call("projects")
-      .then((result) => setProjects(result.projects))
+      .then((result) => {
+        setProjects(result.projects);
+        setDefaultProjectId(result.defaultProjectId);
+      })
       .catch(() => setProjects([]));
     void rpc
       .call("harnesses")
@@ -876,7 +890,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
           toast.error(result.error ?? "That move was refused.");
           return;
         }
-        if (result.dispatchedTo !== null) toast.success("Dispatched to Chief");
+        if (result.dispatchedTo !== null) toast.success("Dispatched");
         else if (result.error !== null) toast.warning(result.error);
         await refresh();
       } catch (error) {
@@ -921,6 +935,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
           <Composer
             rpc={rpc}
             projects={projects}
+            defaultProjectId={defaultProjectId}
             harnesses={harnesses}
             voice={voice}
             onAdded={refresh}
@@ -1054,9 +1069,9 @@ function CommandCenter({ subPath }: { subPath: string }) {
       >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Send this to Chief?</DialogTitle>
+            <DialogTitle>Dispatch this now?</DialogTitle>
             <DialogDescription>
-              Chief will start routing it to a project chief straight away. That
+              It will start routing to a project owner straight away. That
               cannot be undone from here.
             </DialogDescription>
           </DialogHeader>

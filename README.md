@@ -22,6 +22,13 @@ Two lanes run in opposite directions through the board:
   routes it to the owning project chief, which creates the task and hands it to
   an architect. Requests are never dispatched automatically.
 
+## Default project
+
+The composer's project picker starts on the `defaultProject` setting
+(`bb plugin config command-center set defaultProject <id>`) instead of an
+empty "pick automatically" placeholder. Picking a different project for one
+request does not change the setting — it only affects that request.
+
 ## Harness and model
 
 The composer carries two selectors: which **harness** (provider) the work runs

@@ -253,7 +253,7 @@ export function CardViewer({
       setDraft("");
       toast.success(
         result.pending
-          ? "Saved — it reaches the worker once Chief creates the task."
+          ? "Saved — it reaches the worker once the task is created."
           : result.notified > 0
             ? `Sent to ${result.notified} working thread${result.notified === 1 ? "" : "s"}.`
             : "Added to the task.",
@@ -270,7 +270,7 @@ export function CardViewer({
       toast.error(result.error ?? "That move was refused.");
       return;
     }
-    if (result.dispatchedTo !== null) toast.success("Dispatched to Chief");
+    if (result.dispatchedTo !== null) toast.success("Dispatched");
     await load();
   };
 

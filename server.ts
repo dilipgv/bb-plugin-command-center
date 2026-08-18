@@ -323,6 +323,8 @@ export const rpcContract = defineRpcContract({
     input: z.null(),
     output: z.object({
       projects: z.array(z.object({ id: z.string(), name: z.string() })),
+      /** The `defaultProject` setting, so the composer starts pre-selected. */
+      defaultProjectId: z.string().nullable(),
     }),
   },
   board: {
@@ -2679,12 +2681,16 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true };
     },
     async projects() {
-      const projects = await bb.sdk.projects.list({ includePersonal: true });
+      const [projects, values] = await Promise.all([
+        bb.sdk.projects.list({ includePersonal: true }),
+        settings.get(),
+      ]);
       return {
         projects: projects.map((project) => ({
           id: project.id,
           name: project.name,
         })),
+        defaultProjectId: values.defaultProject ?? null,
       };
     },
     async board() {
