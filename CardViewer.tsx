@@ -391,6 +391,7 @@ export function CardViewer({
               rpc={rpc}
               voice={voice}
               onNavigate={(threadId) => navigate.toThread(threadId)}
+              onResolved={() => void load()}
             />
           </Section>
         ) : null}

@@ -160,11 +160,18 @@ export function QuestionCard({
   rpc,
   voice,
   onNavigate,
+  onResolved,
 }: {
   item: InboxItem;
   rpc: Rpc;
   voice: VoiceAvailability;
   onNavigate: (threadId: string) => void;
+  /**
+   * Called after any action actually changes this item's state (answered,
+   * dismissed, snoozed) — the card itself never re-fetches, so without this
+   * the buttons stay on screen looking live after they have already fired.
+   */
+  onResolved?: () => void;
 }) {
   const [text, setText] = React.useState("");
   const [checked, setChecked] = React.useState<string[]>([]);
@@ -226,10 +233,34 @@ export function QuestionCard({
     setBusy(true);
     try {
       const result = await rpc.call("answer", { id: item.id, answer });
-      // ok:false means another surface (a board tile, a second click before
-      // this one re-rendered) already answered this — not an error, just
-      // nothing left to do here.
-      if (result.ok) toast.success("Answered");
+      if (result.ok) {
+        toast.success("Answered");
+        onResolved?.();
+      } else {
+        // Another surface (a board tile, a second click before this one
+        // re-rendered) already answered or dismissed this — say so, since a
+        // silent no-op here just looks like the button did nothing.
+        toast.message("Already handled elsewhere — refreshing.");
+        onResolved?.();
+      }
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const dismiss = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const result = await rpc.call("dismiss", { id: item.id });
+      if (result.ok) {
+        toast.success("Dismissed");
+      } else {
+        toast.message("Already handled elsewhere — refreshing.");
+      }
+      onResolved?.();
     } catch (error) {
       toast.error(String(error));
     } finally {
@@ -238,13 +269,19 @@ export function QuestionCard({
   };
 
   const snooze = async (hours: number) => {
+    if (busy) return;
+    setBusy(true);
     try {
       await rpc.call("snooze", {
         id: item.id,
         untilMs: Date.now() + hours * 3_600_000,
       });
+      toast.success(`Snoozed ${hours}h`);
+      onResolved?.();
     } catch (error) {
       toast.error(String(error));
+    } finally {
+      setBusy(false);
     }
   };
 
