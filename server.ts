@@ -1377,6 +1377,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? `Run it on: ${harness}. Pass these to chief_handoff; it defaults to them anyway.`
         : "",
       "Route this: decide which project owns it, make sure that project has a chief, and send it down. Do not do the work yourself.",
+      "This must end with one accountable owner — a task architect who either does the work directly or fans out to delegates it coordinates — never left as just a reply in this thread.",
       `Ack it as soon as a task exists: \`bb inbox ack ${row.id} --task-key <key>\`.`,
       `Close it when it lands or is abandoned: \`bb inbox close ${row.id} --outcome "…"\`.`,
     ].join("\n");
