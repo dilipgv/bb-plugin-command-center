@@ -1652,15 +1652,43 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /** Open, non-snoozed questions keyed by the task they were asked about. */
-  function openQuestionsByTaskKey(): Map<string, InboxItem> {
+  /**
+   * A task key sitting at the front of free text, the way agents actually write
+   * it — "AMM-18: review PR 2636", "BBC-1 — Fix …". Only meaningful as a
+   * fallback match against a key already known to the board; it is never
+   * trusted to invent one.
+   */
+  const LEADING_TASK_KEY = /^([A-Z][A-Z0-9]{1,9}-\d+)\b/u;
+
+  function leadingTaskKey(text: string): string | null {
+    return LEADING_TASK_KEY.exec(text.trim())?.[1]?.toUpperCase() ?? null;
+  }
+
+  /**
+   * Open questions, keyed by the task they belong to. `--task-key` is the real
+   * signal, but agents routinely forget it and write the key into the `--task`
+   * label instead (every example in the skills said `--task "<key>"`, which
+   * looks right and is not — the prompts are fixed, but a forgotten flag should
+   * not spawn a second, unwanted card for work already on the board). So a
+   * question with no task_key gets one more chance: if a key-shaped token sits
+   * at the front of its task label or question text AND that key is already on
+   * this board, it attaches there instead of standing alone.
+   */
+  function openQuestionsByTaskKey(
+    knownTaskKeys: ReadonlySet<string>,
+  ): Map<string, InboxItem> {
     const now = Date.now();
     const map = new Map<string, InboxItem>();
     for (const item of listItems().open) {
-      if (item.taskKey === null) continue;
       if (item.snoozedUntil !== null && item.snoozedUntil > now) continue;
-      if (!map.has(item.taskKey)) map.set(item.taskKey, item);
+      const key =
+        item.taskKey ??
+        (item.task !== "" ? leadingTaskKey(item.task) : null) ??
+        leadingTaskKey(item.question);
+      if (key === null) continue;
+      if (item.taskKey === null && !knownTaskKeys.has(key)) continue;
+      if (!map.has(key)) map.set(key, item);
     }
-    void now;
     return map;
   }
 
@@ -1825,7 +1853,6 @@ export default async function plugin(bb: BbPluginApi) {
     // The notification sweep only needs lanes, and enrichment costs a Tasks
     // round trip per card plus a git-host call for anything in review.
     const shouldEnrich = options.enrich !== false;
-    const questions = openQuestionsByTaskKey();
     const requests = db
       .prepare<[], RequestRow>(`SELECT * FROM requests`)
       .all();
@@ -1839,6 +1866,15 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(tasksError);
     }
     const taskByKey = new Map(tasks.map((task) => [task.key, task]));
+    // Every task key genuinely on the board, for the fallback match above —
+    // never a reason to attach a question to a key that is not really here.
+    const knownTaskKeys = new Set<string>([
+      ...taskByKey.keys(),
+      ...requests
+        .map((row) => row.task_key)
+        .filter((key): key is string => key !== null),
+    ]);
+    const questions = openQuestionsByTaskKey(knownTaskKeys);
 
     const projectNames = new Map<string, string>();
     try {
