@@ -330,8 +330,8 @@ export function CardViewer({
             {card.title}
           </h1>
 
-          {artifacts.length > 0 ? (
-            <div className="flex flex-wrap gap-2">
+          {artifacts.length > 0 || card.workers.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-2">
               {artifacts.map((artifact) => (
                 <a
                   key={artifact.url}
@@ -348,6 +348,32 @@ export function CardViewer({
                   />
                   <span className="truncate">{artifact.label}</span>
                 </a>
+              ))}
+              {card.workers.map((worker) => (
+                <div
+                  key={worker.threadId}
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-card px-1 py-0.5 text-xs text-foreground"
+                >
+                  <button
+                    type="button"
+                    className="max-w-[220px] truncate px-1 py-0.5 text-left hover:underline"
+                    onClick={() => navigate.toThread(worker.threadId)}
+                  >
+                    {worker.title ?? worker.threadId}
+                  </button>
+                  <span className="shrink-0 text-[10px] text-muted-foreground">
+                    {worker.liveStatus ?? "idle"}
+                  </span>
+                  <StopWorker
+                    threadId={worker.threadId}
+                    isRunning={
+                      worker.liveStatus === "active" ||
+                      worker.liveStatus === "starting"
+                    }
+                    rpc={rpc}
+                    onStopped={() => void load()}
+                  />
+                </div>
               ))}
             </div>
           ) : card.pullRequestsUnavailable ? (
@@ -394,55 +420,6 @@ export function CardViewer({
               onResolved={() => void load()}
             />
           </Section>
-        ) : null}
-
-        {card.workers.length > 0 ? (
-          <Disclosure
-            title="Working on it"
-            preview={`${card.workers.length} thread${card.workers.length === 1 ? "" : "s"}${
-              card.workers.some(
-                (worker) =>
-                  worker.liveStatus === "active" ||
-                  worker.liveStatus === "starting",
-              )
-                ? " · running now"
-                : ""
-            }`}
-            defaultOpen={card.workers.some(
-              (worker) =>
-                worker.liveStatus === "active" ||
-                worker.liveStatus === "starting",
-            )}
-          >
-            <div className="space-y-1">
-              {card.workers.map((worker) => (
-                <div
-                  key={worker.threadId}
-                  className="flex items-center gap-2 rounded-md border border-border px-2 py-1"
-                >
-                  <button
-                    type="button"
-                    className="min-w-0 flex-1 truncate py-0.5 text-left text-sm text-foreground hover:underline"
-                    onClick={() => navigate.toThread(worker.threadId)}
-                  >
-                    {worker.title ?? worker.threadId}
-                  </button>
-                  <span className="shrink-0 text-[10px] text-muted-foreground">
-                    {worker.liveStatus ?? "idle"}
-                  </span>
-                  <StopWorker
-                    threadId={worker.threadId}
-                    isRunning={
-                      worker.liveStatus === "active" ||
-                      worker.liveStatus === "starting"
-                    }
-                    rpc={rpc}
-                    onStopped={() => void load()}
-                  />
-                </div>
-              ))}
-            </div>
-          </Disclosure>
         ) : null}
 
         <Section
