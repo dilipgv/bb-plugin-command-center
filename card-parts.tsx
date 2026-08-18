@@ -198,8 +198,11 @@ export function QuestionCard({
     if (busy) return;
     setBusy(true);
     try {
-      await rpc.call("answer", { id: item.id, answer });
-      toast.success("Answered");
+      const result = await rpc.call("answer", { id: item.id, answer });
+      // ok:false means another surface (a board tile, a second click before
+      // this one re-rendered) already answered this — not an error, just
+      // nothing left to do here.
+      if (result.ok) toast.success("Answered");
     } catch (error) {
       toast.error(String(error));
     } finally {

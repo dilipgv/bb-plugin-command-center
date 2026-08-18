@@ -545,6 +545,12 @@ function BoardCardTile({
     question.options.every(
       (option) => option.length <= QUICK_ANSWER_MAX_LABEL,
     );
+  // This tile and the reader's own answer buttons are two separate mounted
+  // components for the same question — each needs its own guard, or a click
+  // here plus one in the reader (or two quick clicks before this tile
+  // disappears) fire two "answer" calls that the server used to both accept,
+  // each re-sending the whole question into the asker's thread.
+  const [answering, setAnswering] = React.useState(false);
   return (
     <article
       draggable={card.movable}
@@ -631,12 +637,22 @@ function BoardCardTile({
                     size="sm"
                     variant="outline"
                     className="max-w-full"
-                    onClick={() =>
+                    disabled={answering}
+                    onClick={() => {
+                      if (answering) return;
+                      setAnswering(true);
                       void rpc
                         .call("answer", { id: question.id, answer: option })
-                        .then(() => toast.success("Answered"))
+                        .then((result) => {
+                          if (result.ok) toast.success("Answered");
+                          // ok:false means this question was already resolved
+                          // by another click (this tile, or the reader open at
+                          // the same time) — the realtime refresh will remove
+                          // the card; nothing to report as an error.
+                        })
                         .catch((error: unknown) => toast.error(String(error)))
-                    }
+                        .finally(() => setAnswering(false));
+                    }}
                   >
                     {option}
                   </Button>

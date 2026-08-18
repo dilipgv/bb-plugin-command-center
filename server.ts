@@ -885,7 +885,16 @@ export default async function plugin(bb: BbPluginApi) {
     status: "answered" | "dismissed",
     answer: string | null,
   ): boolean {
-    if (!getItem(id)) return false;
+    const row = getItem(id);
+    if (!row) return false;
+    // Idempotent: an already-resolved item ignores a second "answer". Without
+    // this, a duplicate click (a stale board tile and an open reader both
+    // holding their own "answer" button, or any other double-submit) silently
+    // re-armed delivery — delivered_at back to NULL — and re-sent the full
+    // question and answer into the asker's thread again. Genuinely changing an
+    // answer goes through retract() first, which reopens the item before
+    // calling this again.
+    if (row.status !== "open") return false;
     db.prepare(
       `UPDATE items
          SET status = ?, answer = ?, resolved_at = ?, snoozed_until = NULL,
