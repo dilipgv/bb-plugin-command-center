@@ -2607,12 +2607,39 @@ export default async function plugin(bb: BbPluginApi) {
     },
     async addCardComment({ cardId, body }) {
       if (cardId.startsWith("inbx_")) {
-        return {
-          ok: false,
-          notified: 0,
-          pending: false,
-          error: "Answer the question instead of commenting on it.",
-        };
+        // A bare question (most often a review request) has no task to hold a
+        // Tasks comment — but it does have the asker's thread, so a note is a
+        // message there, not a Tasks comment. This is what "Send" on a review
+        // card's card was silently unable to do before: the item's thread_id
+        // was right there and nothing used it.
+        const item = getItem(cardId);
+        if (item === undefined) {
+          return { ok: false, notified: 0, pending: false, error: "No such card." };
+        }
+        if (item.thread_id === null) {
+          return {
+            ok: false,
+            notified: 0,
+            pending: false,
+            error: "This question has no thread to send a note to.",
+          };
+        }
+        try {
+          await bb.sdk.threads.send({
+            threadId: item.thread_id,
+            mode: "auto",
+            input: [
+              {
+                type: "text",
+                text: `Note on "${item.task !== "" ? item.task : item.question}"\n\n${body}`,
+                mentions: [],
+              },
+            ],
+          });
+          return { ok: true, notified: 1, pending: false, error: null };
+        } catch (error) {
+          return { ok: false, notified: 0, pending: false, error: String(error) };
+        }
       }
       const request = requestRow(cardId);
       const taskId =
