@@ -67,12 +67,35 @@ commenting; the title opens the reading view.
 ## Archiving
 
 Every card has an archive control (the tile's hover icon, or the button in the
-reading view). Archiving is **local to this plugin** — it never rewrites a BB
-task's status — and reversible from `Archived` at the foot of the board.
+reading view). The card record itself is **local to this plugin** — it never
+rewrites a BB task's status — and reversible from `Archived` at the foot of the
+board.
 
-One special case: archiving a **question** also dismisses it. A question card
-hides an agent that is still waiting, so putting it away silently would block
-that agent forever; dismissing tells the asker to proceed.
+Archiving a card also archives whoever was working it:
+
+- A request or an adopted task archives every worker thread attached to its BB
+  task (via the Tasks plugin's own thread list).
+- A bare question archives the thread that asked it.
+
+Each of those goes through `bb.sdk.threads.archive`, the same cascade BB's own
+UI uses — so when a thread's worktree environment has no other live thread
+left in it, the host cleans it up (worktree included) on its own, within the
+normal archive grace window. This plugin does not reimplement that cleanup; it
+only decides which threads belong to the card being archived.
+
+Two things it will not do, on purpose:
+
+- **Never** archive Chief's own thread or a project chief's thread, even if one
+  somehow ended up attached to a card — those are the org's standing
+  leadership, never a per-task worker, checked against chief-nav's roster
+  before anything is touched.
+- If a thread fails to archive (already gone, unreachable), the card still
+  archives — you get a toast naming the ones that did not, rather than the
+  whole action being blocked by one bad thread.
+
+Archiving a **question** additionally dismisses it — the card was hiding an
+agent still waiting on you, so leaving it silently would block that agent
+forever; dismissing tells the asker to proceed.
 
 ## Shortcuts
 

@@ -23,6 +23,33 @@ export interface VoiceAvailability {
   error: string | null;
 }
 
+export interface ArchiveCardResult {
+  dismissedQuestion: boolean;
+  archivedThreadIds: string[];
+  threadErrors: { threadId: string; error: string }[];
+}
+
+/**
+ * Say what actually happened — archiving a card can dismiss a question,
+ * archive worker threads (worktrees included), both, or neither (a queued
+ * request nobody had started on yet), and a silent "Archived" would hide
+ * that from the one place it is worth knowing.
+ */
+export function toastArchiveResult(result: ArchiveCardResult): void {
+  const n = result.archivedThreadIds.length;
+  const parts = [
+    result.dismissedQuestion ? "dismissed the question" : null,
+    n > 0 ? `archived ${n} thread${n === 1 ? "" : "s"}` : null,
+  ].filter((part): part is string => part !== null);
+  toast.success(parts.length > 0 ? `Archived — ${parts.join(", ")}.` : "Archived");
+  if (result.threadErrors.length > 0) {
+    const failed = result.threadErrors.length;
+    toast.warning(
+      `The card archived, but ${failed} thread${failed === 1 ? "" : "s"} did not — check ${failed === 1 ? "it" : "them"} directly.`,
+    );
+  }
+}
+
 export function relative(ms: number): string {
   const seconds = Math.round((Date.now() - ms) / 1000);
   if (seconds < 60) return "just now";

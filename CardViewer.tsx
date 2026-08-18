@@ -17,7 +17,11 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
-import { QuestionCard, type VoiceAvailability } from "./card-parts";
+import {
+  QuestionCard,
+  toastArchiveResult,
+  type VoiceAvailability,
+} from "./card-parts";
 import { previewMarkdown } from "./lib/markdown-preview";
 import type { BoardCard, BoardLane, rpcContract } from "./server";
 
@@ -546,11 +550,7 @@ export function CardViewer({
               void rpc
                 .call("archiveCard", { cardId })
                 .then((result) => {
-                  toast.success(
-                    result.dismissedQuestion
-                      ? "Archived — the question was dismissed, so the asker is unblocked."
-                      : "Archived",
-                  );
+                  toastArchiveResult(result);
                   onBack();
                 })
                 .catch((error: unknown) => toast.error(String(error)))

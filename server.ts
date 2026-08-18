@@ -415,6 +415,10 @@ export const rpcContract = defineRpcContract({
       ok: z.boolean(),
       /** True when archiving also dismissed an open question. */
       dismissedQuestion: z.boolean(),
+      /** Worker threads archived along with the card (worktrees included). */
+      archivedThreadIds: z.array(z.string()),
+      /** One entry per thread that failed to archive; the card is still archived. */
+      threadErrors: z.array(z.object({ threadId: z.string(), error: z.string() })),
       error: z.string().nullable(),
     }),
   },
@@ -1314,6 +1318,55 @@ export default async function plugin(bb: BbPluginApi) {
     })();
     publish();
     return true;
+  }
+
+  /**
+   * Chief's own thread plus every project chief's — the org's long-lived
+   * leadership threads, never a per-task worker. Archiving a card can archive
+   * the threads that were doing that one piece of work, but it must never take
+   * out the thread the whole org is running through. Tolerant of chief-nav
+   * being absent: nothing gets excluded, since there is nothing to protect.
+   */
+  async function protectedOrgThreadIds(): Promise<Set<string>> {
+    try {
+      const state = await bb.sdk.plugins.callRpc({
+        pluginId: "chief-nav",
+        method: "state",
+        input: null,
+        outputSchema: z.looseObject({
+          chief: z.looseObject({ threadId: z.string() }).nullable(),
+          groups: z.array(
+            z.looseObject({
+              chief: z.looseObject({ threadId: z.string() }),
+            }),
+          ),
+        }),
+      });
+      const ids = new Set<string>();
+      if (state.chief !== null) ids.add(state.chief.threadId);
+      for (const group of state.groups) ids.add(group.chief.threadId);
+      return ids;
+    } catch {
+      return new Set();
+    }
+  }
+
+  /**
+   * Archive one worker thread and, when its environment was a worktree that
+   * nothing else still needs, let the host clean it up. This is the SDK's own
+   * cascade route (archive and archiveAll both resolve to it) — not something
+   * this plugin reimplements — so the same grace-window undo that applies to
+   * any other archived thread applies here too.
+   */
+  async function archiveWorkerThread(
+    threadId: string,
+  ): Promise<{ threadId: string; error: string | null }> {
+    try {
+      await bb.sdk.threads.archive({ threadId });
+      return { threadId, error: null };
+    } catch (error) {
+      return { threadId, error: String(error) };
+    }
   }
 
   /**
@@ -2764,17 +2817,65 @@ export default async function plugin(bb: BbPluginApi) {
       // without answering would leave that agent blocked forever, so put the
       // question away properly: dismissed, which tells the asker.
       let dismissedQuestion = false;
-      if (getItem(cardId) !== undefined) {
+      const item = getItem(cardId);
+      if (item !== undefined) {
         resolveItem(cardId, "dismissed", null);
         dismissedQuestion = true;
       }
+
+      // Find whoever was actually working this card, so archiving it archives
+      // them too — cleaning up their worktree along with everything else, not
+      // just hiding the card while the thread and its checkout sit around.
+      let candidateThreadIds: string[] = [];
+      if (item !== undefined) {
+        if (item.thread_id !== null) candidateThreadIds = [item.thread_id];
+      } else {
+        const request = requestRow(cardId);
+        const taskId =
+          request !== undefined
+            ? request.task_key !== null
+              ? (await resolveTaskByKey(request.task_key))?.id ?? null
+              : null
+            : cardId; // an adopted task card: the id already is the task id.
+        if (taskId !== null) {
+          candidateThreadIds = (await taskWorkers(taskId)).map(
+            (worker) => worker.threadId,
+          );
+        }
+      }
+
+      const protectedIds =
+        candidateThreadIds.length > 0 ? await protectedOrgThreadIds() : null;
+      const threadIds = candidateThreadIds.filter(
+        (threadId) => !(protectedIds?.has(threadId) ?? false),
+      );
+      const archived = await Promise.all(threadIds.map(archiveWorkerThread));
+      const archivedThreadIds = archived
+        .filter((result) => result.error === null)
+        .map((result) => result.threadId);
+      const threadErrors = archived
+        .filter(
+          (result): result is { threadId: string; error: string } =>
+            result.error !== null,
+        )
+        .map((result) => ({ threadId: result.threadId, error: result.error }));
+      for (const { threadId, error } of threadErrors) {
+        bb.log.warn(`could not archive thread ${threadId}: ${error}`);
+      }
+
       db.prepare(
         `INSERT INTO archived_cards (card_id, archived_at) VALUES (?, ?)
          ON CONFLICT(card_id) DO UPDATE SET archived_at = excluded.archived_at`,
       ).run(cardId, Date.now());
       db.prepare(`DELETE FROM notify_state WHERE card_id = ?`).run(cardId);
       publish();
-      return { ok: true, dismissedQuestion, error: null };
+      return {
+        ok: true,
+        dismissedQuestion,
+        archivedThreadIds,
+        threadErrors,
+        error: null,
+      };
     },
     unarchiveCard({ cardId }) {
       const result = db

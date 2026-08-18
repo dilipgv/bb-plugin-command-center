@@ -42,6 +42,7 @@ import {
   HeardLine,
   MicButton,
   relative,
+  toastArchiveResult,
   untilLabel,
   type VoiceAvailability,
 } from "./card-parts";
@@ -855,11 +856,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
     async (cardId: string) => {
       try {
         const result = await rpc.call("archiveCard", { cardId });
-        toast.success(
-          result.dismissedQuestion
-            ? "Archived — the question was dismissed, so the asker is unblocked."
-            : "Archived",
-        );
+        toastArchiveResult(result);
         await Promise.all([refresh(), loadArchived()]);
       } catch (error) {
         toast.error(String(error));
