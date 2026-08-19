@@ -370,6 +370,21 @@ export const rpcContract = defineRpcContract({
     }),
   },
   /**
+   * Hand this card's task to a brand-new architect thread via chief-nav —
+   * for when the existing worker has gone idle with its environment already
+   * cleaned up, so nothing can wake it to read a new comment. The Captain
+   * triggers this explicitly; it is never automatic, since it spends real
+   * agent time and a fresh worktree.
+   */
+  wakeTask: {
+    input: z.object({ cardId: z.string() }).strict(),
+    output: z.object({
+      ok: z.boolean(),
+      threadId: z.string().nullable(),
+      error: z.string().nullable(),
+    }),
+  },
+  /**
    * The sidebar badge's number. Deliberately one cheap COUNT: the nav badge
    * polls it, and the board's own rpc is far too heavy for that.
    */
@@ -426,7 +441,13 @@ export const rpcContract = defineRpcContract({
   },
   unarchiveCard: {
     input: z.object({ cardId: z.string() }).strict(),
-    output: z.object({ ok: z.boolean() }),
+    output: z.object({
+      ok: z.boolean(),
+      /** Worker threads brought back along with the card. */
+      unarchivedThreadIds: z.array(z.string()),
+      /** One entry per thread that failed to unarchive; the card is still unarchived. */
+      threadErrors: z.array(z.object({ threadId: z.string(), error: z.string() })),
+    }),
   },
   archivedCards: {
     input: z.null(),
@@ -795,6 +816,9 @@ export default async function plugin(bb: BbPluginApi) {
     // Which harness and model the Captain wants this work run on.
     `ALTER TABLE requests ADD COLUMN provider_id TEXT`,
     `ALTER TABLE requests ADD COLUMN model TEXT`,
+    // Which threads archiving this card archived, so unarchiving it can bring
+    // them back rather than leaving them archived with no way back from here.
+    `ALTER TABLE archived_cards ADD COLUMN thread_ids TEXT`,
   ]);
 
   function publish(): void {
@@ -1365,6 +1389,18 @@ export default async function plugin(bb: BbPluginApi) {
   ): Promise<{ threadId: string; error: string | null }> {
     try {
       await bb.sdk.threads.archive({ threadId });
+      return { threadId, error: null };
+    } catch (error) {
+      return { threadId, error: String(error) };
+    }
+  }
+
+  /** The other half of archiveWorkerThread — brings a worker back on unarchive. */
+  async function unarchiveWorkerThread(
+    threadId: string,
+  ): Promise<{ threadId: string; error: string | null }> {
+    try {
+      await bb.sdk.threads.unarchive({ threadId });
       return { threadId, error: null };
     } catch (error) {
       return { threadId, error: String(error) };
@@ -2785,6 +2821,100 @@ export default async function plugin(bb: BbPluginApi) {
         return { ok: false, notified: 0, pending: false, error: String(error) };
       }
     },
+    async wakeTask({ cardId }) {
+      const request = requestRow(cardId);
+      let task: TaskRow | null;
+      if (request !== undefined) {
+        if (request.task_key === null) {
+          return { ok: false, threadId: null, error: "This card has no task yet." };
+        }
+        task = await resolveTaskByKey(request.task_key);
+      } else {
+        try {
+          const result = await tasksCall(
+            "getTask",
+            { taskId: cardId },
+            z.object({ task: taskRowSchema.nullable() }),
+          );
+          task = result.task;
+        } catch (error) {
+          return { ok: false, threadId: null, error: String(error) };
+        }
+      }
+      if (task === null || task.projectId === undefined || task.projectId === null) {
+        return { ok: false, threadId: null, error: "Could not resolve this card's task." };
+      }
+
+      let recentComments: string[] = [];
+      try {
+        const result = await tasksCall(
+          "listComments",
+          { taskId: task.id },
+          z.object({
+            comments: z.array(
+              z.looseObject({
+                body: z.string(),
+                authorName: z.string().nullish(),
+                kind: z.string().nullish(),
+              }),
+            ),
+          }),
+        );
+        recentComments = result.comments
+          .slice(-12)
+          .map((comment) => `${comment.authorName ?? comment.kind ?? "?"}: ${comment.body}`);
+      } catch {
+        // Best effort — a fresh architect still works from the task's own
+        // description without this, just with less history.
+      }
+
+      const mission = [
+        task.description ?? "",
+        "",
+        "## Why you are fresh",
+        "The previous worker thread on this task went idle and its worktree was already cleaned up by BB, so nothing could wake it to read new comments. You are a clean continuation of the same task — read the history below before doing anything.",
+        "",
+        "## Task history",
+        ...(recentComments.length > 0 ? recentComments : ["(no prior comments)"]),
+      ].join("\n");
+
+      try {
+        const handoff = await bb.sdk.plugins.callRpc({
+          pluginId: "chief-nav",
+          method: "handoffTask",
+          input: {
+            taskKey: task.key,
+            title: task.title,
+            mission,
+            projectId: task.projectId,
+          },
+          outputSchema: z.object({
+            threadId: z.string(),
+            projectId: z.string(),
+            title: z.string(),
+            providerId: z.string().nullable(),
+            model: z.string().nullable(),
+          }),
+        });
+        try {
+          await tasksCall(
+            "taskThreadsAttach",
+            { taskId: task.id, threadId: handoff.threadId },
+            z.object({ threadId: z.string() }),
+          );
+        } catch (error) {
+          // The new thread exists and owns the task either way; only the
+          // board's own thread list would be missing it until reattached.
+          bb.log.warn(
+            `handed off ${task.key} to ${handoff.threadId} but could not attach it: ${String(error)}`,
+          );
+        }
+        publish();
+        return { ok: true, threadId: handoff.threadId, error: null };
+      } catch (error) {
+        return { ok: false, threadId: null, error: String(error) };
+      }
+    },
     async harnesses() {
       const [{ harnesses, error }, chosen] = await Promise.all([
         listHarnesses(),
@@ -2870,9 +3000,11 @@ export default async function plugin(bb: BbPluginApi) {
       }
 
       db.prepare(
-        `INSERT INTO archived_cards (card_id, archived_at) VALUES (?, ?)
-         ON CONFLICT(card_id) DO UPDATE SET archived_at = excluded.archived_at`,
-      ).run(cardId, Date.now());
+        `INSERT INTO archived_cards (card_id, archived_at, thread_ids) VALUES (?, ?, ?)
+         ON CONFLICT(card_id) DO UPDATE SET
+           archived_at = excluded.archived_at,
+           thread_ids = excluded.thread_ids`,
+      ).run(cardId, Date.now(), JSON.stringify(archivedThreadIds));
       db.prepare(`DELETE FROM notify_state WHERE card_id = ?`).run(cardId);
       publish();
       return {
@@ -2883,12 +3015,46 @@ export default async function plugin(bb: BbPluginApi) {
         error: null,
       };
     },
-    unarchiveCard({ cardId }) {
+    async unarchiveCard({ cardId }) {
+      const row = db
+        .prepare<[string], { thread_ids: string | null }>(
+          `SELECT thread_ids FROM archived_cards WHERE card_id = ?`,
+        )
+        .get(cardId);
+      let threadIds: string[] = [];
+      if (row?.thread_ids !== null && row?.thread_ids !== undefined) {
+        try {
+          const parsed = JSON.parse(row.thread_ids) as unknown;
+          if (Array.isArray(parsed)) {
+            threadIds = parsed.filter(
+              (entry): entry is string => typeof entry === "string",
+            );
+          }
+        } catch {
+          // Pre-existing archived_cards rows have no thread_ids at all —
+          // nothing to bring back, not an error.
+        }
+      }
+
+      const unarchived = await Promise.all(threadIds.map(unarchiveWorkerThread));
+      const unarchivedThreadIds = unarchived
+        .filter((result) => result.error === null)
+        .map((result) => result.threadId);
+      const threadErrors = unarchived
+        .filter(
+          (result): result is { threadId: string; error: string } =>
+            result.error !== null,
+        )
+        .map((result) => ({ threadId: result.threadId, error: result.error }));
+      for (const { threadId, error } of threadErrors) {
+        bb.log.warn(`could not unarchive thread ${threadId}: ${error}`);
+      }
+
       const result = db
         .prepare(`DELETE FROM archived_cards WHERE card_id = ?`)
         .run(cardId);
       publish();
-      return { ok: result.changes > 0 };
+      return { ok: result.changes > 0, unarchivedThreadIds, threadErrors };
     },
     async archivedCards() {
       const rows = db

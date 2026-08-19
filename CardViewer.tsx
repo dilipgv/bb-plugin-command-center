@@ -130,6 +130,64 @@ function StopWorker({
 }
 
 /**
+ * Spin up a fresh architect thread for this card's task via chief-nav, for
+ * when the existing worker has gone idle with its worktree already cleaned
+ * up — nothing can wake it, so a comment or a re-review just sits there.
+ * Two-step: this spends real agent time and a fresh worktree, never fired
+ * by accident.
+ */
+function WakeTask({
+  cardId,
+  rpc,
+  onWoken,
+}: {
+  cardId: string;
+  rpc: Rpc;
+  onWoken: (threadId: string) => void;
+}) {
+  const [armed, setArmed] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+
+  React.useEffect(() => {
+    if (!armed) return;
+    const timer = window.setTimeout(() => setArmed(false), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [armed]);
+
+  return (
+    <Button
+      size="sm"
+      variant={armed ? "default" : "outline"}
+      disabled={busy}
+      onClick={() => {
+        if (!armed) {
+          setArmed(true);
+          return;
+        }
+        setBusy(true);
+        void rpc
+          .call("wakeTask", { cardId })
+          .then((result) => {
+            if (result.ok && result.threadId !== null) {
+              toast.success("Handed off to a fresh thread");
+              onWoken(result.threadId);
+            } else {
+              toast.error(result.error ?? "Could not wake this task up");
+            }
+          })
+          .catch((error: unknown) => toast.error(String(error)))
+          .finally(() => {
+            setBusy(false);
+            setArmed(false);
+          });
+      }}
+    >
+      {busy ? "Waking…" : armed ? "Wake up — confirm" : "Wake up in a new thread"}
+    </Button>
+  );
+}
+
+/**
  * A closed-by-default section. The page should open as a scannable table of
  * contents — the request, the outcome, twenty updates — and you expand the one
  * you came for. Nothing here is short enough to be worth reading unasked.
@@ -264,7 +322,7 @@ export function CardViewer({
         // and is exactly what had the Captain re-sending the same comment
         // three times over — say plainly that nothing live got it.
         toast.warning(
-          "Recorded on the task, but no working thread picked it up — it may be idle or its worktree is gone. Check the thread directly if this needs action now.",
+          "Recorded on the task, but no working thread picked it up — it may be idle or its worktree is gone. Use \"Wake up in a new thread\" above if this needs action now.",
         );
       }
       await load();
@@ -302,6 +360,12 @@ export function CardViewer({
 
   const summaries = comments.filter((entry) => entry.kind !== "system");
   const events = comments.filter((entry) => entry.kind === "system");
+  const canWake =
+    card.taskKey !== null &&
+    !card.workers.some(
+      (worker) =>
+        worker.liveStatus === "active" || worker.liveStatus === "starting",
+    );
 
   return (
     <div className="h-full overflow-y-auto">
@@ -339,7 +403,7 @@ export function CardViewer({
             {card.title}
           </h1>
 
-          {artifacts.length > 0 || card.workers.length > 0 ? (
+          {artifacts.length > 0 || card.workers.length > 0 || canWake ? (
             <div className="flex flex-wrap items-center gap-2">
               {artifacts.map((artifact) => (
                 <a
@@ -384,6 +448,13 @@ export function CardViewer({
                   />
                 </div>
               ))}
+              {canWake ? (
+                <WakeTask
+                  cardId={cardId}
+                  rpc={rpc}
+                  onWoken={(threadId) => navigate.toThread(threadId)}
+                />
+              ) : null}
             </div>
           ) : card.pullRequestsUnavailable ? (
             <p className="text-xs text-muted-foreground">
