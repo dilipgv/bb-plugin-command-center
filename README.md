@@ -154,9 +154,16 @@ bb plugin config command-center set notify off         # off | important | all
 bb plugin config command-center set notifySound true
 ```
 
-`important` (the default) notifies on a new question or review request, and when
-a card reaches **In review**, **Needs you** or **Done**. `all` adds every other
-lane change. Urgent questions always play a sound.
+`important` (the default) notifies when a card reaches **In review**, **Needs
+you** or **Done**. `all` adds every other lane change. Urgent questions always
+play a sound.
+
+The banner names the card, not the message inside it — a new question used to
+fire an immediate notification carrying the full question text, on top of the
+lane-change one that follows moments later when it lands in Needs you. Same
+event, twice, and the second one was already the more readable of the two: the
+card renders it properly, a notification banner just truncates it. One
+notification per status change now; open the card for the rest.
 
 Two deliberate choices. It runs in the **backend**, not the panel, because on
 macOS bb keeps running with its window closed — a frontend notifier would go

@@ -905,8 +905,6 @@ export default async function plugin(bb: BbPluginApi) {
       input.urgent ? 1 : 0,
     );
     publish();
-    const row = getItem(id);
-    if (row !== undefined) void notifyQuestion(toItem(row));
     return id;
   }
 
@@ -2253,24 +2251,6 @@ export default async function plugin(bb: BbPluginApi) {
           : lane === "done"
             ? "Done"
             : "Queue";
-  }
-
-  /** Tell the Captain about one open question the moment it is filed. */
-  async function notifyQuestion(item: InboxItem): Promise<void> {
-    const { mode, sound } = await notifySetting();
-    if (mode === "off") return;
-    db.prepare(
-      `INSERT INTO notify_state (card_id, lane, task_status, notified_at)
-       VALUES (?, 'needs_you', NULL, ?)
-       ON CONFLICT(card_id) DO UPDATE SET lane = 'needs_you', notified_at = excluded.notified_at`,
-    ).run(item.id, Date.now());
-    const who = item.askedBy !== null ? ` (${item.askedBy})` : "";
-    await notifyMac(
-      NOTIFY_TITLE,
-      `${item.urgent ? "Urgent — " : ""}${item.task !== "" ? item.task : "Needs you"}${who}`,
-      item.question,
-      sound || item.urgent,
-    );
   }
 
   /**
