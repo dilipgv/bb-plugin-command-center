@@ -522,10 +522,10 @@ const DRAG_MIME = "application/x-bb-inbox-card";
 
 function workerTone(liveStatus: string | null): string {
   switch (liveStatus) {
-    case "active":
+    case "working":
     case "starting":
       return "text-foreground";
-    case "error":
+    case "failed":
       return "text-destructive";
     default:
       return "text-muted-foreground";

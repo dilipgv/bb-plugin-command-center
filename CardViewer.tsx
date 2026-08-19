@@ -364,7 +364,7 @@ export function CardViewer({
     card.taskKey !== null &&
     !card.workers.some(
       (worker) =>
-        worker.liveStatus === "active" || worker.liveStatus === "starting",
+        worker.liveStatus === "working" || worker.liveStatus === "starting",
     );
 
   return (
@@ -440,7 +440,7 @@ export function CardViewer({
                   <StopWorker
                     threadId={worker.threadId}
                     isRunning={
-                      worker.liveStatus === "active" ||
+                      worker.liveStatus === "working" ||
                       worker.liveStatus === "starting"
                     }
                     rpc={rpc}
