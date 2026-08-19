@@ -50,6 +50,26 @@ export function toastArchiveResult(result: ArchiveCardResult): void {
   }
 }
 
+export interface UnarchiveCardResult {
+  unarchivedThreadIds: string[];
+  threadErrors: { threadId: string; error: string }[];
+}
+
+export function toastUnarchiveResult(result: UnarchiveCardResult): void {
+  const n = result.unarchivedThreadIds.length;
+  toast.success(
+    n > 0
+      ? `Restored to the board — brought back ${n} thread${n === 1 ? "" : "s"}.`
+      : "Restored to the board",
+  );
+  if (result.threadErrors.length > 0) {
+    const failed = result.threadErrors.length;
+    toast.warning(
+      `The card is back, but ${failed} thread${failed === 1 ? "" : "s"} did not unarchive — check ${failed === 1 ? "it" : "them"} directly.`,
+    );
+  }
+}
+
 export function relative(ms: number): string {
   const seconds = Math.round((Date.now() - ms) / 1000);
   if (seconds < 60) return "just now";

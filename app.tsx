@@ -43,6 +43,7 @@ import {
   MicButton,
   relative,
   toastArchiveResult,
+  toastUnarchiveResult,
   untilLabel,
   type VoiceAvailability,
 } from "./card-parts";
@@ -1012,8 +1013,8 @@ function CommandCenter({ subPath }: { subPath: string }) {
                     onClick={() =>
                       void rpc
                         .call("unarchiveCard", { cardId: entry.cardId })
-                        .then(async () => {
-                          toast.success("Restored to the board");
+                        .then(async (result) => {
+                          toastUnarchiveResult(result);
                           await Promise.all([refresh(), loadArchived()]);
                         })
                         .catch((error: unknown) => toast.error(String(error)))
