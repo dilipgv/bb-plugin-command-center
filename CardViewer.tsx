@@ -251,13 +251,22 @@ export function CardViewer({
         return;
       }
       setDraft("");
-      toast.success(
-        result.pending
-          ? "Saved — it reaches the worker once the task is created."
-          : result.notified > 0
-            ? `Sent to ${result.notified} working thread${result.notified === 1 ? "" : "s"}.`
-            : "Added to the task.",
-      );
+      if (result.pending) {
+        toast.success("Saved — it reaches the worker once the task is created.");
+      } else if (result.notified > 0) {
+        toast.success(
+          `Sent to ${result.notified} working thread${result.notified === 1 ? "" : "s"}.`,
+        );
+      } else {
+        // notified=0 means nobody live picked it up — most often the worker's
+        // thread has gone idle with its environment already cleaned up, so it
+        // cannot be woken to read this. Saying "Added" here reads as success
+        // and is exactly what had the Captain re-sending the same comment
+        // three times over — say plainly that nothing live got it.
+        toast.warning(
+          "Recorded on the task, but no working thread picked it up — it may be idle or its worktree is gone. Check the thread directly if this needs action now.",
+        );
+      }
       await load();
     } finally {
       setBusy(false);
