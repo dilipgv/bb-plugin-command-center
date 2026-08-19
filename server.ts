@@ -2821,8 +2821,35 @@ export default async function plugin(bb: BbPluginApi) {
           return { ok: false, threadId: null, error: String(error) };
         }
       }
-      if (task === null || task.projectId === undefined || task.projectId === null) {
+      if (task === null) {
         return { ok: false, threadId: null, error: "Could not resolve this card's task." };
+      }
+
+      // task.projectId is the Tasks plugin's OWN internal project id (a ULID,
+      // its "AMM"-style space) — never a BB project id, even though the field
+      // is confusingly named the same. The request this card came from
+      // carries the real BB project id it was dispatched into; a card
+      // adopted straight from a task has no such request, so fall back to
+      // whichever BB project an existing worker thread already lives in.
+      let projectId = request?.project_id ?? null;
+      if (projectId === null) {
+        const workers = await taskWorkers(task.id);
+        for (const worker of workers) {
+          try {
+            const thread = await bb.sdk.threads.get({ threadId: worker.threadId });
+            projectId = thread.projectId;
+            break;
+          } catch {
+            // Try the next worker thread.
+          }
+        }
+      }
+      if (projectId === null) {
+        return {
+          ok: false,
+          threadId: null,
+          error: "Could not resolve this task's BB project — no request or worker thread to read it from.",
+        };
       }
 
       let recentComments: string[] = [];
@@ -2866,7 +2893,7 @@ export default async function plugin(bb: BbPluginApi) {
             taskKey: task.key,
             title: task.title,
             mission,
-            projectId: task.projectId,
+            projectId,
           },
           outputSchema: z.object({
             threadId: z.string(),
