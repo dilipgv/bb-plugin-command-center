@@ -2892,6 +2892,7 @@ export default async function plugin(bb: BbPluginApi) {
         publish();
         return { ok: true, threadId: handoff.threadId, error: null };
       } catch (error) {
+        bb.log.warn(`wakeTask failed for ${task.key}: ${String(error)}`);
         return { ok: false, threadId: null, error: String(error) };
       }
     },
