@@ -2852,7 +2852,17 @@ export default async function plugin(bb: BbPluginApi) {
         };
       }
 
+      const oldWorkers = await taskWorkers(task.id);
+
       let recentComments: string[] = [];
+      // Comments a Captain added that never reached a live thread (the exact
+      // "wake up" scenario) — notifiedCount stays 0 forever once written,
+      // since Tasks only sets it at delivery time. Forward these to the new
+      // thread directly instead of leaving them to wait for the next comment
+      // Tasks' own delivery would still misroute to the now-archived thread,
+      // since it targets whoever last commented as an agent — which stays the
+      // old thread until the new one comments on the task itself.
+      let stuck: string[] = [];
       try {
         const result = await tasksCall(
           "listComments",
@@ -2863,6 +2873,7 @@ export default async function plugin(bb: BbPluginApi) {
                 body: z.string(),
                 authorName: z.string().nullish(),
                 kind: z.string().nullish(),
+                notifiedCount: z.number().nullish(),
               }),
             ),
           }),
@@ -2870,6 +2881,9 @@ export default async function plugin(bb: BbPluginApi) {
         recentComments = result.comments
           .slice(-12)
           .map((comment) => `${comment.authorName ?? comment.kind ?? "?"}: ${comment.body}`);
+        stuck = result.comments
+          .filter((comment) => comment.kind === "user" && (comment.notifiedCount ?? 0) === 0)
+          .map((comment) => `${comment.authorName ?? "You"}: ${comment.body}`);
       } catch {
         // Best effort — a fresh architect still works from the task's own
         // description without this, just with less history.
@@ -2880,6 +2894,10 @@ export default async function plugin(bb: BbPluginApi) {
         "",
         "## Why you are fresh",
         "The previous worker thread on this task went idle and its worktree was already cleaned up by BB, so nothing could wake it to read new comments. You are a clean continuation of the same task — read the history below before doing anything.",
+        "",
+        "As your very first action, run `bb tasks comment " +
+          task.key +
+          ' --body "Picking this up."` (or a real status update if you already have one) — until you post a task comment yourself, any new comment the Captain adds will still be misrouted to the thread that just went idle.',
         "",
         "## Task history",
         ...(recentComments.length > 0 ? recentComments : ["(no prior comments)"]),
@@ -2916,6 +2934,51 @@ export default async function plugin(bb: BbPluginApi) {
             `handed off ${task.key} to ${handoff.threadId} but could not attach it: ${String(error)}`,
           );
         }
+
+        if (stuck.length > 0) {
+          try {
+            await bb.sdk.threads.send({
+              threadId: handoff.threadId,
+              mode: "auto",
+              input: [
+                {
+                  type: "text",
+                  text: [
+                    `${stuck.length} comment${stuck.length === 1 ? "" : "s"} on ${task.key} never reached a live thread before you existed:`,
+                    "",
+                    ...stuck,
+                  ].join("\n"),
+                  mentions: [],
+                },
+              ],
+            });
+          } catch (error) {
+            bb.log.warn(
+              `handed off ${task.key} to ${handoff.threadId} but could not forward ${stuck.length} stuck comment(s): ${String(error)}`,
+            );
+          }
+        }
+
+        // The old thread(s) are done being useful — archive them so the card
+        // stops showing a dead worker next to the live one, and so BB can
+        // reclaim their worktrees. Never touch the new thread just created.
+        const oldThreadIds = oldWorkers
+          .map((worker) => worker.threadId)
+          .filter((threadId) => threadId !== handoff.threadId);
+        if (oldThreadIds.length > 0) {
+          const protectedIds = await protectedOrgThreadIds();
+          const archived = await Promise.all(
+            oldThreadIds
+              .filter((threadId) => !protectedIds.has(threadId))
+              .map(archiveWorkerThread),
+          );
+          for (const result of archived) {
+            if (result.error !== null) {
+              bb.log.warn(`could not archive old worker ${result.threadId}: ${result.error}`);
+            }
+          }
+        }
+
         publish();
         return { ok: true, threadId: handoff.threadId, error: null };
       } catch (error) {
