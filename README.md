@@ -244,8 +244,8 @@ command, its own agent tools (`chief_project_chief`, `chief_handoff`,
 `chief_roster`) and its own database. This plugin never imports it; the two
 talk only over `bb.sdk.plugins.callRpc`:
 
-- Dispatching a request asks chief-nav's `state` rpc for the live Chief thread,
-  falling back to the `chiefThreadId` setting if chief-nav is not installed.
+- Dispatching a request asks chief-nav's `state` rpc for the live Chief thread.
+  Without chief-nav installed, dispatch surfaces a clear error instead.
 - chief-nav's needs-input rail reads this plugin's `list` rpc.
 - chief-nav reads this plugin's `dispatchPreference` rpc to honour the
   harness/model chosen in the composer when handing work to an architect.

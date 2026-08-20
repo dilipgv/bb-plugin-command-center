@@ -688,11 +688,6 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
-    chiefThreadId: {
-      type: "string",
-      label: "Chief thread id",
-      default: "",
-    },
     defaultProject: { type: "project", label: "Default project for requests" },
     // BB's keyboard settings only accept its own built-in commands, so the
     // panel owns these and reads them from here.
@@ -1439,15 +1434,10 @@ export default async function plugin(bb: BbPluginApi) {
     } catch (error) {
       bb.log.debug(`chief-nav unavailable: ${String(error)}`);
     }
-    const configured = (await settings.get()).chiefThreadId.trim();
-    if (configured !== "") {
-      return { threadId: configured, status: null, error: null };
-    }
     return {
       threadId: null,
       status: null,
-      error:
-        "No Chief thread found. Start Chief in the Chief panel, or set the Chief thread id in this plugin's settings.",
+      error: "No Chief thread found. Start Chief in the Chief panel.",
     };
   }
 
