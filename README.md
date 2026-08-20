@@ -1,5 +1,7 @@
 # bb-plugin-command-center
 
+![Board](docs/screenshots/board.png)
+
 The Captain's command center: a board of everything in flight and the
 questions waiting on you. It dispatches work to Chief but does not own it —
 Chief is the separate `chief-nav` plugin, talked to only over cross-plugin rpc.
