@@ -1523,23 +1523,41 @@ export default async function plugin(bb: BbPluginApi) {
    * still show up in the brief even when Chief itself isn't reachable but
    * chief-nav's data still is.
    */
-  function renderWorkflowSection(workflow: {
+  interface FetchedWorkflow {
     name: string;
     steps: { name: string; instructions: string; providerId?: string; model?: string }[];
-  }): string {
+  }
+
+  /**
+   * A workflow overrides execution, not just instructs it: its first step's
+   * harness is what the directly-spawned thread actually runs on, not a
+   * suggestion layered over whatever the composer's own harness selector
+   * picked. Only later steps naming a *different* harness delegate.
+   */
+  function renderWorkflowSection(
+    workflow: FetchedWorkflow,
+    ownProviderId: string | null,
+  ): string {
     const steps = workflow.steps
       .map((step, index) => {
         const harness = [step.providerId ?? null, step.model ?? null]
           .filter((part): part is string => part !== null)
           .join("/");
-        const spawnCmd =
-          step.providerId !== undefined
-            ? `\`bb thread spawn --parent-self --project "$BB_PROJECT_ID" --provider ${step.providerId}${
-                step.model !== undefined ? ` --model ${step.model}` : ""
-              } --prompt "<this step's instructions plus whatever context it needs>"\`, then \`bb thread wait <id>\` and \`bb thread output <id>\` to read its result before continuing.`
-            : null;
+        const delegates =
+          step.providerId !== undefined && step.providerId !== ownProviderId;
+        const spawnCmd = delegates
+          ? `\`bb thread spawn --parent-self --project "$BB_PROJECT_ID" --provider ${step.providerId}${
+              step.model !== undefined ? ` --model ${step.model}` : ""
+            } --prompt "<this step's instructions plus whatever context it needs>"\`, then \`bb thread wait <id>\` and \`bb thread output <id>\` to read its result before continuing.`
+          : null;
         return [
-          `${index + 1}. **${step.name}**${harness !== "" ? ` — run on ${harness}` : ""}`,
+          `${index + 1}. **${step.name}**${
+            harness !== ""
+              ? delegates
+                ? ` — run on ${harness}`
+                : ` — this is your own harness (${harness}); do it directly`
+              : ""
+          }`,
           `   ${step.instructions}`,
           ...(spawnCmd !== null ? [`   Run it: ${spawnCmd}`] : []),
         ].join("\n");
@@ -1547,14 +1565,14 @@ export default async function plugin(bb: BbPluginApi) {
       .join("\n");
     return [
       `## Workflow: ${workflow.name}`,
-      "Follow these steps in order. A step naming no harness is yours to do directly. A step naming one is a real child thread on that harness, spawned with the exact command given for it — you stay the one continuous thread; wait for the child, read its output, then move to the next step.",
+      "Follow these steps in order. A step naming no harness, or naming the harness you already run on, is yours to do directly. A step naming a different harness is a real child thread on that harness, spawned with the exact command given for it — you stay the one continuous thread; wait for the child, read its output, then move to the next step.",
       "",
       steps,
     ].join("\n");
   }
 
-  async function fetchWorkflowSection(workflowName: string | null): Promise<string> {
-    if (workflowName === null) return "";
+  async function fetchWorkflow(workflowName: string | null): Promise<FetchedWorkflow | null> {
+    if (workflowName === null) return null;
     try {
       const result = await bb.sdk.plugins.callRpc({
         pluginId: "chief-nav",
@@ -1576,19 +1594,21 @@ export default async function plugin(bb: BbPluginApi) {
             .nullable(),
         }),
       });
-      return result.workflow ? `\n\n${renderWorkflowSection(result.workflow)}` : "";
+      return result.workflow;
     } catch {
       // chief-nav is unreachable too — the worker just runs without a named
       // protocol rather than blocking dispatch on it.
-      return "";
+      return null;
     }
   }
 
   /** The brief a directly-spawned worker gets for a brand-new request. */
-  async function directDispatchBrief(
+  function directDispatchBrief(
     row: RequestRow,
     projectName: string | null,
-  ): Promise<string> {
+    workflow: FetchedWorkflow | null,
+    ownProviderId: string | null,
+  ): string {
     const scope = [
       `priority ${coercePriority(row.priority)}`,
       row.urgent === 1 ? "URGENT" : null,
@@ -1596,7 +1616,9 @@ export default async function plugin(bb: BbPluginApi) {
     ]
       .filter((part): part is string => part !== null && part !== undefined)
       .join(" · ");
-    const workflowSection = await fetchWorkflowSection(row.workflow_name);
+    const workflowSection = workflow
+      ? `\n\n${renderWorkflowSection(workflow, ownProviderId)}`
+      : "";
     return [
       `COMMAND CENTER REQUEST ${row.id} · ${scope}`,
       "",
@@ -1762,12 +1784,17 @@ export default async function plugin(bb: BbPluginApi) {
       };
     }
     try {
+      const workflow = await fetchWorkflow(row.workflow_name);
+      const primaryStep = workflow?.steps[0];
+      const providerId = primaryStep?.providerId ?? row.provider_id;
+      const model =
+        primaryStep?.providerId !== undefined ? primaryStep.model ?? null : row.model;
       const { threadId } = await spawnWorkerDirect({
         projectId,
         title: row.title,
-        prompt: await directDispatchBrief(row, projectName),
-        providerId: row.provider_id,
-        model: row.model,
+        prompt: directDispatchBrief(row, projectName, workflow, providerId),
+        providerId,
+        model,
       });
       db.prepare(
         `UPDATE requests
