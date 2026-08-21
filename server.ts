@@ -718,6 +718,12 @@ export default async function plugin(bb: BbPluginApi) {
       options: ["off", "1", "3", "6", "12", "24"],
       default: "3",
     },
+    directWorktree: {
+      type: "boolean",
+      label:
+        "Give directly-dispatched work its own worktree (used only when Chief isn't available)",
+      default: true,
+    },
   });
 
   const db = bb.storage.database();
@@ -1186,6 +1192,51 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  /**
+   * Command Center leans on two companion plugins it does not bundle: BB's
+   * own Tasks plugin (task keys, comments, board status — almost everything
+   * task-related goes through it) and chief-nav (routes dispatched work
+   * through an org instead of a flat worker thread). Neither is declared
+   * anywhere in the manifest — there is no such field — so a fresh install
+   * of this plugin alone leaves both silently missing until something tries
+   * to use them and fails. Installing them here, once, closes that gap.
+   * Both stay genuinely optional: dispatch and wake-up already fall back to
+   * spawning a worker thread directly when chief-nav is not reachable.
+   */
+  async function ensureCompanionPlugins(): Promise<void> {
+    let ids: Set<string>;
+    try {
+      ids = new Set((await bb.sdk.plugins.list()).plugins.map((entry) => entry.id));
+    } catch (error) {
+      bb.log.warn(`could not check installed plugins: ${String(error)}`);
+      return;
+    }
+    if (!ids.has("tasks")) {
+      try {
+        await bb.sdk.plugins.install({ source: "builtin:tasks" });
+        bb.log.info("installed the Tasks plugin (command-center depends on it)");
+      } catch (error) {
+        bb.log.warn(`could not auto-install the Tasks plugin: ${String(error)}`);
+      }
+    }
+    if (!ids.has("chief-nav")) {
+      try {
+        await bb.sdk.plugins.install({
+          source: "git:https://github.com/dilipgv/bb-plugin-chief-nav.git@^0.1.0",
+        });
+        bb.log.info("installed the chief-nav companion plugin");
+      } catch (error) {
+        bb.log.warn(`could not auto-install chief-nav: ${String(error)}`);
+      }
+    }
+  }
+
+  bb.background.service("ensure-companions", {
+    async start() {
+      await ensureCompanionPlugins();
+    },
+  });
+
   bb.background.service("notify-watch", {
     async start(signal) {
       let tick = 0;
@@ -1401,6 +1452,86 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
+   * A worktree environment requires an explicit hostId — there is no caller
+   * thread to infer one from when this plugin spawns a worker directly.
+   * Picks the first connected host, correct for the common single-host
+   * setup; a real multi-host deployment would need this to be a choice.
+   */
+  async function defaultHostId(): Promise<string> {
+    const hosts = await bb.sdk.hosts.list();
+    const connected = hosts.find((host) => host.status === "connected");
+    if (connected) return connected.id;
+    if (hosts[0]) return hosts[0].id;
+    throw new Error("no host is registered — connect a host before spawning a worktree worker");
+  }
+
+  /**
+   * Spawn a worker thread directly — used when there is no Chief org to
+   * route work through. Chief is preferred whenever it is reachable; this
+   * is the fallback that keeps Dispatch and Wake up working without it.
+   */
+  async function spawnWorkerDirect(input: {
+    projectId: string;
+    title: string;
+    prompt: string;
+    providerId: string | null;
+    model: string | null;
+  }): Promise<{ threadId: string }> {
+    const { directWorktree } = await settings.get();
+    const thread = await bb.sdk.threads.spawn({
+      projectId: input.projectId,
+      title: input.title,
+      ...(input.providerId !== null ? { providerId: input.providerId } : {}),
+      ...(input.model !== null ? { model: input.model } : {}),
+      environment: directWorktree
+        ? {
+            type: "host",
+            hostId: await defaultHostId(),
+            workspace: { type: "managed-worktree", baseBranch: { kind: "default" } },
+          }
+        : { type: "project-default" },
+      prompt: input.prompt,
+    });
+    return { threadId: thread.id };
+  }
+
+  /** The brief a directly-spawned worker gets for a brand-new request. */
+  function directDispatchBrief(row: RequestRow, projectName: string | null): string {
+    const scope = [
+      `priority ${coercePriority(row.priority)}`,
+      row.urgent === 1 ? "URGENT" : null,
+      projectName ?? row.project_id,
+    ]
+      .filter((part): part is string => part !== null && part !== undefined)
+      .join(" · ");
+    return [
+      `COMMAND CENTER REQUEST ${row.id} · ${scope}`,
+      "",
+      row.title,
+      ...(row.body.trim() !== "" ? ["", row.body.trim()] : []),
+      "",
+      "No Chief org is reachable right now, so there is nobody to route this to — you are its accountable owner end to end. Do it yourself, or fan out to delegates you coordinate, but stay the one thread the Captain can check on.",
+      `First: \`bb tasks create --title "…" --description "…" --json\` for a task key, then \`bb inbox ack ${row.id} --task-key <key>\` so this lands on the right card, then \`bb tasks attach <key> --thread $BB_THREAD_ID\`.`,
+      `Escalate decisions through the Inbox: \`bb inbox ask --task "<key>" --task-key "<key>" --question "…" --option … --asked-by "worker: <key>"\`. Point at this thread for review: \`bb inbox review --task "<key>" --task-key "<key>" --question "…" --thread $BB_THREAD_ID\`.`,
+      `Close it when it lands or is abandoned: \`bb inbox close ${row.id} --outcome "…"\`.`,
+    ].join("\n");
+  }
+
+  /** The brief a directly-spawned worker gets when waking an existing task. */
+  function directWakeBrief(task: TaskRow, mission: string): string {
+    return [
+      `You are the accountable owner of ${task.key}: ${task.title}.`,
+      "No Chief org is reachable right now, so there is no architect hierarchy above you — you report to nobody but the Captain, through the Inbox.",
+      "",
+      mission,
+      "",
+      `Attach yourself to the task: \`bb tasks attach ${task.key} --thread $BB_THREAD_ID\`.`,
+      `Escalate decisions: \`bb inbox ask --task "${task.key}" --task-key "${task.key}" --question "…" --option … --asked-by "worker: ${task.key}"\`. Point at this thread for review: \`bb inbox review --task "${task.key}" --task-key "${task.key}" --question "…" --thread $BB_THREAD_ID\`.`,
+      `Keep status current: \`bb tasks update ${task.key} --status <status>\`.`,
+    ].join("\n");
+  }
+
+  /**
    * Where Chief lives. chief-nav owns that fact, so ask it first and fall back
    * to the setting — this plugin stays useful without chief-nav installed,
    * exactly as chief-nav stays useful without this one.
@@ -1485,10 +1616,6 @@ export default async function plugin(bb: BbPluginApi) {
         error: `Request ${id} is already ${row.state}.`,
       };
     }
-    const chief = await chiefThread();
-    if (chief.threadId === null) {
-      return { ok: false, threadId: null, error: chief.error };
-    }
 
     let projectName: string | null = null;
     if (row.project_id !== null) {
@@ -1502,26 +1629,60 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
 
-    try {
-      await bb.sdk.threads.send({
-        threadId: chief.threadId,
-        mode: "auto",
-        input: [
-          { type: "text", text: dispatchBrief(row, projectName), mentions: [] },
-        ],
-      });
-    } catch (error) {
-      return { ok: false, threadId: chief.threadId, error: String(error) };
+    // Chief is preferred whenever it is reachable — it routes into the org's
+    // project-chief/architect hierarchy. When it isn't, dispatch still has to
+    // work, so this spawns the worker directly instead of just failing.
+    const chief = await chiefThread();
+    if (chief.threadId !== null) {
+      try {
+        await bb.sdk.threads.send({
+          threadId: chief.threadId,
+          mode: "auto",
+          input: [
+            { type: "text", text: dispatchBrief(row, projectName), mentions: [] },
+          ],
+        });
+      } catch (error) {
+        return { ok: false, threadId: chief.threadId, error: String(error) };
+      }
+
+      db.prepare(
+        `UPDATE requests
+           SET state = 'dispatched', chief_thread_id = ?, dispatched_at = ?
+         WHERE id = ?`,
+      ).run(chief.threadId, Date.now(), id);
+      publish();
+      bb.log.info(`dispatched ${id} to Chief ${chief.threadId}`);
+      return { ok: true, threadId: chief.threadId, error: null };
     }
 
-    db.prepare(
-      `UPDATE requests
-         SET state = 'dispatched', chief_thread_id = ?, dispatched_at = ?
-       WHERE id = ?`,
-    ).run(chief.threadId, Date.now(), id);
-    publish();
-    bb.log.info(`dispatched ${id} to Chief ${chief.threadId}`);
-    return { ok: true, threadId: chief.threadId, error: null };
+    const projectId = row.project_id ?? (await settings.get()).defaultProject ?? null;
+    if (projectId === null) {
+      return {
+        ok: false,
+        threadId: null,
+        error: "No Chief org, and no project to dispatch into — pick a project or set a default one.",
+      };
+    }
+    try {
+      const { threadId } = await spawnWorkerDirect({
+        projectId,
+        title: row.title,
+        prompt: directDispatchBrief(row, projectName),
+        providerId: row.provider_id,
+        model: row.model,
+      });
+      db.prepare(
+        `UPDATE requests
+           SET state = 'dispatched', chief_thread_id = ?, dispatched_at = ?
+         WHERE id = ?`,
+      ).run(threadId, Date.now(), id);
+      publish();
+      bb.log.info(`dispatched ${id} directly to ${threadId} (no Chief org)`);
+      return { ok: true, threadId, error: null };
+    } catch (error) {
+      return { ok: false, threadId: null, error: String(error) };
+    }
   }
 
   async function ackRequest(id: string, taskKey: string): Promise<boolean> {
@@ -2893,6 +3054,9 @@ export default async function plugin(bb: BbPluginApi) {
         ...(recentComments.length > 0 ? recentComments : ["(no prior comments)"]),
       ].join("\n");
 
+      // Chief is preferred whenever it is reachable — same reasoning as
+      // dispatch. When it isn't, spawn the replacement worker directly.
+      let newThreadId: string;
       try {
         const handoff = await bb.sdk.plugins.callRpc({
           pluginId: "chief-nav",
@@ -2911,70 +3075,86 @@ export default async function plugin(bb: BbPluginApi) {
             model: z.string().nullable(),
           }),
         });
+        newThreadId = handoff.threadId;
+      } catch (chiefError) {
         try {
-          await tasksCall(
-            "taskThreadsAttach",
-            { taskId: task.id, threadId: handoff.threadId },
-            z.object({ threadId: z.string() }),
-          );
+          const preferred = await dispatchPreferenceFor(task.key);
+          const direct = await spawnWorkerDirect({
+            projectId,
+            title: task.title,
+            prompt: directWakeBrief(task, mission),
+            providerId: preferred.providerId,
+            model: preferred.model,
+          });
+          newThreadId = direct.threadId;
         } catch (error) {
-          // The new thread exists and owns the task either way; only the
-          // board's own thread list would be missing it until reattached.
           bb.log.warn(
-            `handed off ${task.key} to ${handoff.threadId} but could not attach it: ${String(error)}`,
+            `wakeTask failed for ${task.key}: no Chief org (${String(chiefError)}), then direct spawn also failed: ${String(error)}`,
           );
+          return { ok: false, threadId: null, error: String(error) };
         }
-
-        if (stuck.length > 0) {
-          try {
-            await bb.sdk.threads.send({
-              threadId: handoff.threadId,
-              mode: "auto",
-              input: [
-                {
-                  type: "text",
-                  text: [
-                    `${stuck.length} comment${stuck.length === 1 ? "" : "s"} on ${task.key} never reached a live thread before you existed:`,
-                    "",
-                    ...stuck,
-                  ].join("\n"),
-                  mentions: [],
-                },
-              ],
-            });
-          } catch (error) {
-            bb.log.warn(
-              `handed off ${task.key} to ${handoff.threadId} but could not forward ${stuck.length} stuck comment(s): ${String(error)}`,
-            );
-          }
-        }
-
-        // The old thread(s) are done being useful — archive them so the card
-        // stops showing a dead worker next to the live one, and so BB can
-        // reclaim their worktrees. Never touch the new thread just created.
-        const oldThreadIds = oldWorkers
-          .map((worker) => worker.threadId)
-          .filter((threadId) => threadId !== handoff.threadId);
-        if (oldThreadIds.length > 0) {
-          const protectedIds = await protectedOrgThreadIds();
-          const archived = await Promise.all(
-            oldThreadIds
-              .filter((threadId) => !protectedIds.has(threadId))
-              .map(archiveWorkerThread),
-          );
-          for (const result of archived) {
-            if (result.error !== null) {
-              bb.log.warn(`could not archive old worker ${result.threadId}: ${result.error}`);
-            }
-          }
-        }
-
-        publish();
-        return { ok: true, threadId: handoff.threadId, error: null };
-      } catch (error) {
-        bb.log.warn(`wakeTask failed for ${task.key}: ${String(error)}`);
-        return { ok: false, threadId: null, error: String(error) };
       }
+
+      try {
+        await tasksCall(
+          "taskThreadsAttach",
+          { taskId: task.id, threadId: newThreadId },
+          z.object({ threadId: z.string() }),
+        );
+      } catch (error) {
+        // The new thread exists and owns the task either way; only the
+        // board's own thread list would be missing it until reattached.
+        bb.log.warn(
+          `handed off ${task.key} to ${newThreadId} but could not attach it: ${String(error)}`,
+        );
+      }
+
+      if (stuck.length > 0) {
+        try {
+          await bb.sdk.threads.send({
+            threadId: newThreadId,
+            mode: "auto",
+            input: [
+              {
+                type: "text",
+                text: [
+                  `${stuck.length} comment${stuck.length === 1 ? "" : "s"} on ${task.key} never reached a live thread before you existed:`,
+                  "",
+                  ...stuck,
+                ].join("\n"),
+                mentions: [],
+              },
+            ],
+          });
+        } catch (error) {
+          bb.log.warn(
+            `handed off ${task.key} to ${newThreadId} but could not forward ${stuck.length} stuck comment(s): ${String(error)}`,
+          );
+        }
+      }
+
+      // The old thread(s) are done being useful — archive them so the card
+      // stops showing a dead worker next to the live one, and so BB can
+      // reclaim their worktrees. Never touch the new thread just created.
+      const oldThreadIds = oldWorkers
+        .map((worker) => worker.threadId)
+        .filter((threadId) => threadId !== newThreadId);
+      if (oldThreadIds.length > 0) {
+        const protectedIds = await protectedOrgThreadIds();
+        const archived = await Promise.all(
+          oldThreadIds
+            .filter((threadId) => !protectedIds.has(threadId))
+            .map(archiveWorkerThread),
+        );
+        for (const result of archived) {
+          if (result.error !== null) {
+            bb.log.warn(`could not archive old worker ${result.threadId}: ${result.error}`);
+          }
+        }
+      }
+
+      publish();
+      return { ok: true, threadId: newThreadId, error: null };
     },
     async harnesses() {
       const [{ harnesses, error }, chosen] = await Promise.all([
