@@ -1532,15 +1532,22 @@ export default async function plugin(bb: BbPluginApi) {
         const harness = [step.providerId ?? null, step.model ?? null]
           .filter((part): part is string => part !== null)
           .join("/");
+        const spawnCmd =
+          step.providerId !== undefined
+            ? `\`bb thread spawn --parent-self --project "$BB_PROJECT_ID" --provider ${step.providerId}${
+                step.model !== undefined ? ` --model ${step.model}` : ""
+              } --prompt "<this step's instructions plus whatever context it needs>"\`, then \`bb thread wait <id>\` and \`bb thread output <id>\` to read its result before continuing.`
+            : null;
         return [
-          `${index + 1}. **${step.name}**${harness !== "" ? ` — run this step as a delegate subagent on ${harness}` : ""}`,
+          `${index + 1}. **${step.name}**${harness !== "" ? ` — run on ${harness}` : ""}`,
           `   ${step.instructions}`,
+          ...(spawnCmd !== null ? [`   Run it: ${spawnCmd}`] : []),
         ].join("\n");
       })
       .join("\n");
     return [
       `## Workflow: ${workflow.name}`,
-      "Follow these steps in order. A step naming a harness runs as a delegate subagent on that harness — you stay the one continuous thread; only that piece runs elsewhere. A step naming none is yours to do directly.",
+      "Follow these steps in order. A step naming no harness is yours to do directly. A step naming one is a real child thread on that harness, spawned with the exact command given for it — you stay the one continuous thread; wait for the child, read its output, then move to the next step.",
       "",
       steps,
     ].join("\n");
