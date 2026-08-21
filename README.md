@@ -237,7 +237,7 @@ bb inbox close <id> --outcome "Shipped in PR #412"
 
 Agents get the same surface through the bundled `user-inbox` skill.
 
-## Chief
+## Chief, and working without it
 
 Chief is the separate `chief-nav` plugin — its own panel, its own `bb chief`
 command, its own agent tools (`chief_project_chief`, `chief_handoff`,
@@ -245,17 +245,37 @@ command, its own agent tools (`chief_project_chief`, `chief_handoff`,
 talk only over `bb.sdk.plugins.callRpc`:
 
 - Dispatching a request asks chief-nav's `state` rpc for the live Chief thread.
-  Without chief-nav installed, dispatch surfaces a clear error instead.
 - chief-nav's needs-input rail reads this plugin's `list` rpc.
 - chief-nav reads this plugin's `dispatchPreference` rpc to honour the
   harness/model chosen in the composer when handing work to an architect.
 
-Each plugin stays useful with the other absent — a missing Chief surfaces as
-`chiefError` on the board rather than breaking it.
+Chief is preferred whenever it is reachable, but never required. Without it,
+**Dispatch** and **Wake up in a new thread** spawn the worker directly
+(`bb.sdk.threads.spawn`, the same primitive chief-nav itself uses) with a
+self-contained brief: create and attach its own task, ack the request back,
+escalate through the Inbox, close it when done. `directWorktree` (on by
+default) controls whether that direct spawn gets its own worktree.
 
 (The two lived merged into one plugin for a while, sharing a database and CLI
 command; they were split back into separate plugins, restoring the original
 cross-plugin contract above.)
+
+## Companion plugins
+
+This plugin needs two things it does not bundle, and there is no plugin
+manifest field to declare either as a dependency — so a fresh install of just
+this plugin would otherwise leave both silently missing:
+
+- **BB's own Tasks plugin** — task keys, comments, board status. Nearly
+  everything task-related goes through it.
+- **chief-nav** — optional (see above), but installed by default for the full
+  experience.
+
+An `ensure-companions` background service checks for both on load and installs
+whichever is missing (`builtin:tasks`, and chief-nav from its published
+repository) — no prompt, since Tasks ships with `bb` itself and chief-nav is
+this same author's companion plugin. If you deliberately do not want Chief,
+removing it after install is fine; dispatch keeps working either way.
 
 ## Data
 
