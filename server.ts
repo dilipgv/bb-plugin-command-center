@@ -271,6 +271,8 @@ export const rpcContract = defineRpcContract({
         urgent: z.boolean().optional(),
         providerId: z.string().nullish(),
         model: z.string().nullish(),
+        /** Name of a chief-nav workflow (bb chief workflow list) to follow. */
+        workflowName: z.string().nullish(),
       })
       .strict(),
     output: z.object({ id: z.string() }),
@@ -410,6 +412,20 @@ export const rpcContract = defineRpcContract({
       })
       .strict(),
     output: z.object({ ok: z.boolean() }),
+  },
+  /**
+   * Named workflows chief-nav has defined (bb chief workflow list), for the
+   * composer to offer as a choice. Empty, not an error, when chief-nav is
+   * absent — a workflow is an enhancement Chief applies, never a requirement.
+   */
+  workflows: {
+    input: z.null(),
+    output: z.object({
+      workflows: z.array(
+        z.object({ id: z.string(), name: z.string(), stepCount: z.number() }),
+      ),
+      error: z.string().nullable(),
+    }),
   },
   /**
    * The harness/model preference for one task, for Chief to read over
@@ -582,6 +598,7 @@ interface RequestRow {
   outcome: string | null;
   provider_id: string | null;
   model: string | null;
+  workflow_name: string | null;
 }
 
 const MAX_DELIVERY_ATTEMPTS = 20;
@@ -820,6 +837,9 @@ export default async function plugin(bb: BbPluginApi) {
     // Which threads archiving this card archived, so unarchiving it can bring
     // them back rather than leaving them archived with no way back from here.
     `ALTER TABLE archived_cards ADD COLUMN thread_ids TEXT`,
+    // Which chief-nav workflow (bb chief workflow list) this request's
+    // architect should follow, if any.
+    `ALTER TABLE requests ADD COLUMN workflow_name TEXT`,
   ]);
 
   function publish(): void {
@@ -1336,13 +1356,14 @@ export default async function plugin(bb: BbPluginApi) {
     urgent?: boolean;
     providerId?: string | null;
     model?: string | null;
+    workflowName?: string | null;
   }): string {
     const id = newId("cc");
     db.prepare(
       `INSERT INTO requests (
          id, created_at, title, body, project_id, priority, urgent, state,
-         queue_pos, provider_id, model
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)`,
+         queue_pos, provider_id, model, workflow_name
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
     ).run(
       id,
       Date.now(),
@@ -1354,6 +1375,7 @@ export default async function plugin(bb: BbPluginApi) {
       nextQueuePos(),
       input.providerId ?? null,
       input.model ?? null,
+      input.workflowName ?? null,
     );
     publish();
     return id;
@@ -1495,8 +1517,71 @@ export default async function plugin(bb: BbPluginApi) {
     return { threadId: thread.id };
   }
 
+  /**
+   * chief-nav's own workflow rendering, duplicated rather than imported since
+   * the two plugins share no code — a workflow named on a request should
+   * still show up in the brief even when Chief itself isn't reachable but
+   * chief-nav's data still is.
+   */
+  function renderWorkflowSection(workflow: {
+    name: string;
+    steps: { name: string; instructions: string; providerId?: string; model?: string }[];
+  }): string {
+    const steps = workflow.steps
+      .map((step, index) => {
+        const harness = [step.providerId ?? null, step.model ?? null]
+          .filter((part): part is string => part !== null)
+          .join("/");
+        return [
+          `${index + 1}. **${step.name}**${harness !== "" ? ` — run this step as a delegate subagent on ${harness}` : ""}`,
+          `   ${step.instructions}`,
+        ].join("\n");
+      })
+      .join("\n");
+    return [
+      `## Workflow: ${workflow.name}`,
+      "Follow these steps in order. A step naming a harness runs as a delegate subagent on that harness — you stay the one continuous thread; only that piece runs elsewhere. A step naming none is yours to do directly.",
+      "",
+      steps,
+    ].join("\n");
+  }
+
+  async function fetchWorkflowSection(workflowName: string | null): Promise<string> {
+    if (workflowName === null) return "";
+    try {
+      const result = await bb.sdk.plugins.callRpc({
+        pluginId: "chief-nav",
+        method: "getWorkflow",
+        input: { name: workflowName },
+        outputSchema: z.object({
+          workflow: z
+            .object({
+              name: z.string(),
+              steps: z.array(
+                z.object({
+                  name: z.string(),
+                  instructions: z.string(),
+                  providerId: z.string().optional(),
+                  model: z.string().optional(),
+                }),
+              ),
+            })
+            .nullable(),
+        }),
+      });
+      return result.workflow ? `\n\n${renderWorkflowSection(result.workflow)}` : "";
+    } catch {
+      // chief-nav is unreachable too — the worker just runs without a named
+      // protocol rather than blocking dispatch on it.
+      return "";
+    }
+  }
+
   /** The brief a directly-spawned worker gets for a brand-new request. */
-  function directDispatchBrief(row: RequestRow, projectName: string | null): string {
+  async function directDispatchBrief(
+    row: RequestRow,
+    projectName: string | null,
+  ): Promise<string> {
     const scope = [
       `priority ${coercePriority(row.priority)}`,
       row.urgent === 1 ? "URGENT" : null,
@@ -1504,6 +1589,7 @@ export default async function plugin(bb: BbPluginApi) {
     ]
       .filter((part): part is string => part !== null && part !== undefined)
       .join(" · ");
+    const workflowSection = await fetchWorkflowSection(row.workflow_name);
     return [
       `COMMAND CENTER REQUEST ${row.id} · ${scope}`,
       "",
@@ -1514,6 +1600,7 @@ export default async function plugin(bb: BbPluginApi) {
       `First: \`bb tasks create --title "…" --description "…" --json\` for a task key, then \`bb inbox ack ${row.id} --task-key <key>\` so this lands on the right card, then \`bb tasks attach <key> --thread $BB_THREAD_ID\`.`,
       `Escalate decisions through the Inbox: \`bb inbox ask --task "<key>" --task-key "<key>" --question "…" --option … --asked-by "worker: <key>"\`. Point at this thread for review: \`bb inbox review --task "<key>" --task-key "<key>" --question "…" --thread $BB_THREAD_ID\`.`,
       `Close it when it lands or is abandoned: \`bb inbox close ${row.id} --outcome "…"\`.`,
+      workflowSection,
     ].join("\n");
   }
 
@@ -1595,6 +1682,9 @@ export default async function plugin(bb: BbPluginApi) {
       harness !== ""
         ? `Run it on: ${harness}. Pass these to chief_handoff; it defaults to them anyway.`
         : "",
+      row.workflow_name !== null
+        ? `Workflow: "${row.workflow_name}" — pass workflowName: "${row.workflow_name}" to chief_handoff for this task.`
+        : "",
       "Route this: decide which project owns it, make sure that project has a chief, and send it down. Do not do the work yourself.",
       "This must end with one accountable owner — a task architect who either does the work directly or fans out to delegates it coordinates — never left as just a reply in this thread.",
       `Ack it as soon as a task exists: \`bb inbox ack ${row.id} --task-key <key>\`.`,
@@ -1668,7 +1758,7 @@ export default async function plugin(bb: BbPluginApi) {
       const { threadId } = await spawnWorkerDirect({
         projectId,
         title: row.title,
-        prompt: directDispatchBrief(row, projectName),
+        prompt: await directDispatchBrief(row, projectName),
         providerId: row.provider_id,
         model: row.model,
       });
@@ -2806,6 +2896,7 @@ export default async function plugin(bb: BbPluginApi) {
           urgent: input.urgent,
           providerId: input.providerId ?? fallback.providerId,
           model: input.model ?? fallback.model,
+          workflowName: input.workflowName ?? null,
         }),
       };
     },
@@ -3167,6 +3258,23 @@ export default async function plugin(bb: BbPluginApi) {
         defaultModel: chosen.model,
         error,
       };
+    },
+    async workflows() {
+      try {
+        const result = await bb.sdk.plugins.callRpc({
+          pluginId: "chief-nav",
+          method: "listWorkflows",
+          input: null,
+          outputSchema: z.object({
+            workflows: z.array(
+              z.object({ id: z.string(), name: z.string(), stepCount: z.number() }),
+            ),
+          }),
+        });
+        return { workflows: result.workflows, error: null };
+      } catch (error) {
+        return { workflows: [], error: String(error) };
+      }
     },
     async setDispatchDefault({ providerId, model }) {
       await bb.storage.kv.set("dispatch-default", {

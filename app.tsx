@@ -157,6 +157,7 @@ function Composer({
   projects,
   defaultProjectId,
   harnesses,
+  workflows,
   voice,
   onAdded,
 }: {
@@ -168,6 +169,7 @@ function Composer({
     defaultProviderId: string | null;
     defaultModel: string | null;
   };
+  workflows: { id: string; name: string; stepCount: number }[];
   voice: VoiceAvailability;
   onAdded: () => void;
 }) {
@@ -182,6 +184,7 @@ function Composer({
   // runs on, and changing it is remembered.
   const [providerId, setProviderId] = React.useState("");
   const [model, setModel] = React.useState("");
+  const [workflowName, setWorkflowName] = React.useState("");
 
   React.useEffect(() => {
     setProviderId(harnesses.defaultProviderId ?? "");
@@ -287,6 +290,7 @@ function Composer({
         urgent,
         providerId: providerId === "" ? null : providerId,
         model: model === "" ? null : model,
+        workflowName: workflowName === "" ? null : workflowName,
       });
       if (dispatchNow) {
         const result = await rpc.call("dispatchRequest", { id });
@@ -438,6 +442,21 @@ function Composer({
               </select>
             ) : null}
           </>
+        ) : null}
+        {workflows.length > 0 ? (
+          <select
+            value={workflowName}
+            aria-label="Workflow for the architect to follow"
+            onChange={(event) => setWorkflowName(event.target.value)}
+            className="h-7 max-w-[11rem] rounded-md border border-input bg-transparent px-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <option value="">No workflow</option>
+            {workflows.map((workflow) => (
+              <option key={workflow.id} value={workflow.name}>
+                {workflow.name} ({workflow.stepCount})
+              </option>
+            ))}
+          </select>
         ) : null}
         <Button
           size="sm"
@@ -794,6 +813,9 @@ function CommandCenter({ subPath }: { subPath: string }) {
     defaultProviderId: string | null;
     defaultModel: string | null;
   }>({ list: [], defaultProviderId: null, defaultModel: null });
+  const [workflows, setWorkflows] = React.useState<
+    { id: string; name: string; stepCount: number }[]
+  >([]);
   const [voice, setVoice] = React.useState<VoiceAvailability>({
     enabled: false,
     error: null,
@@ -830,6 +852,12 @@ function CommandCenter({ subPath }: { subPath: string }) {
       .catch((error: unknown) =>
         setVoice({ enabled: false, error: String(error) }),
       );
+    // Empty, not an error toast, when chief-nav is absent — a workflow is an
+    // enhancement Chief applies, never something dispatch requires.
+    void rpc
+      .call("workflows")
+      .then((result) => setWorkflows(result.workflows))
+      .catch(() => setWorkflows([]));
   }, [rpc]);
 
   const openThread = React.useCallback(
@@ -938,6 +966,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
             projects={projects}
             defaultProjectId={defaultProjectId}
             harnesses={harnesses}
+            workflows={workflows}
             voice={voice}
             onAdded={refresh}
           />
