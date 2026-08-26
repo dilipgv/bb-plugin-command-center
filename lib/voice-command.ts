@@ -9,7 +9,7 @@
  * part of the title, which is what keeps "fix the urgent care banner" intact.
  *
  * Pure functions only: no plugin API, no DOM. Exercisable from the CLI with
- * `bb inbox voice-parse "<transcript>"`.
+ * `bb command-center voice-parse "<transcript>"`.
  */
 
 export interface VoiceProject {
@@ -238,7 +238,7 @@ function resolveProject(
  * Project matching for a phrase that is supposed to be *only* a project name.
  *
  * Deliberately asymmetric: a short spoken fragment may name a longer project
- * ("mcp micros" → "atlassian-mcp-micros"), but a long phrase that merely
+ * ("mcp micros" → "acme-mcp-micros"), but a long phrase that merely
  * contains a project name is not a project reference — otherwise
  * "in ecosystem add caching to the graph endpoint" is consumed whole and the
  * title comes out empty.

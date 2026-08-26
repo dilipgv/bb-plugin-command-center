@@ -8,10 +8,9 @@
  *   requests you → the org. Work you queue and then dispatch to Chief, which
  *            demuxes it to the owning project chief and its architects.
  *
- * Chief is a separate plugin (chief-nav). The two talk only over cross-plugin
- * rpc: this module asks chief-nav where Chief's thread lives to dispatch a
- * request, exposes `dispatchPreference` for chief-nav to read the harness/model
- * choice back, and `list` for chief-nav's needs-input rail.
+ * Chief (Chief, project chiefs, task architects) lives in this same plugin —
+ * dispatching a request resolves the owning project chief and hands off to
+ * an architect directly, no cross-plugin rpc involved.
  *
  * The `items` schema predates a rebuild; migrations 0–11 reconstruct it exactly
  * so an existing data.db is adopted untouched. Append only at the end.
@@ -51,8 +50,9 @@ const REQUEST_STATES = [
 ] as const;
 
 /**
- * The item DTO is a published contract: chief-nav reads `list().open` to draw
- * its "waiting on the Captain" rail, so fields may be added but never renamed.
+ * The item DTO is a published contract: `chiefNeedsInput()` below reads
+ * `list().open` to draw the Chief nav rail, so fields may be added but never
+ * renamed.
  */
 const itemDto = z.object({
   id: z.string(),
@@ -227,6 +227,40 @@ const boardCommentDto = z.object({
   pending: z.boolean(),
 });
 
+const threadStatus = z.enum(["starting", "active", "idle", "stopping", "error"]);
+
+const navThread = z.object({
+  threadId: z.string(),
+  title: z.string(),
+  status: threadStatus.nullable(),
+  taskKey: z.string().nullable(),
+  subtitle: z.string().nullable(),
+  retired: z.boolean(),
+  createdAt: z.number().nullable(),
+});
+
+const chiefNeedsInputItem = z.object({
+  id: z.string(),
+  question: z.string(),
+  task: z.string(),
+  taskKey: z.string().nullable(),
+  askedBy: z.string().nullable(),
+  urgent: z.boolean(),
+  reviewThreadId: z.string().nullable(),
+  askerThreadId: z.string().nullable(),
+});
+
+const projectGroup = z.object({
+  projectId: z.string(),
+  projectName: z.string(),
+  chief: navThread,
+  architects: z.array(navThread),
+});
+
+export type ChiefNavThread = z.infer<typeof navThread>;
+export type ChiefNavGroup = z.infer<typeof projectGroup>;
+export type ChiefNavNeedsInput = z.infer<typeof chiefNeedsInputItem>;
+
 export const rpcContract = defineRpcContract({
   list: {
     input: z.null(),
@@ -271,7 +305,7 @@ export const rpcContract = defineRpcContract({
         urgent: z.boolean().optional(),
         providerId: z.string().nullish(),
         model: z.string().nullish(),
-        /** Name of a chief-nav workflow (bb chief workflow list) to follow. */
+        /** Name of a workflow (bb command-center workflow list) to follow. */
         workflowName: z.string().nullish(),
       })
       .strict(),
@@ -372,7 +406,7 @@ export const rpcContract = defineRpcContract({
     }),
   },
   /**
-   * Hand this card's task to a brand-new architect thread via chief-nav —
+   * Hand this card's task to a brand-new architect thread via Chief —
    * for when the existing worker has gone idle with its environment already
    * cleaned up, so nothing can wake it to read a new comment. The Captain
    * triggers this explicitly; it is never automatic, since it spends real
@@ -414,9 +448,9 @@ export const rpcContract = defineRpcContract({
     output: z.object({ ok: z.boolean() }),
   },
   /**
-   * Named workflows chief-nav has defined (bb chief workflow list), for the
-   * composer to offer as a choice. Empty, not an error, when chief-nav is
-   * absent — a workflow is an enhancement Chief applies, never a requirement.
+   * Named workflows Chief has defined (bb command-center workflow list), for
+   * the composer to offer as a choice. A workflow is an enhancement Chief
+   * applies, never a requirement.
    */
   workflows: {
     input: z.null(),
@@ -426,6 +460,30 @@ export const rpcContract = defineRpcContract({
       ),
       error: z.string().nullable(),
     }),
+  },
+  /** The Chief panel's whole state: the org tree plus what's waiting on the Captain. */
+  state: {
+    input: z.null(),
+    output: z.object({
+      chief: navThread.nullable(),
+      chiefProjectId: z.string().nullable(),
+      groups: z.array(projectGroup),
+      needsInput: z.array(chiefNeedsInputItem),
+      needsInputError: z.string().nullable(),
+    }),
+  },
+  ensureChief: {
+    input: z.null(),
+    output: z.object({ threadId: z.string(), created: z.boolean() }),
+  },
+  /** Promote an existing thread to Chief (e.g. after a provider migration). */
+  adoptChief: {
+    input: z.object({ threadId: z.string() }).strict(),
+    output: z.object({ ok: z.boolean() }),
+  },
+  setRetired: {
+    input: z.object({ threadId: z.string(), retired: z.boolean() }).strict(),
+    output: z.object({ ok: z.boolean() }),
   },
   /**
    * The harness/model preference for one task, for Chief to read over
@@ -535,7 +593,7 @@ export const rpcContract = defineRpcContract({
       options: z.array(z.string()),
     }),
   },
-  /** Test phrasing without a microphone. Also powers `bb inbox voice-parse`. */
+  /** Test phrasing without a microphone. Also powers `bb command-center voice-parse`. */
   parseVoice: {
     input: z.object({ transcript: z.string() }).strict(),
     output: z.object({
@@ -607,6 +665,16 @@ function newId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}${Math.random()
     .toString(36)
     .slice(2, 8)}`;
+}
+
+/** Only http(s) — this is the one guard between free-text input and `<a href>`. */
+function isHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 function parseOptions(raw: string): string[] {
@@ -741,6 +809,33 @@ export default async function plugin(bb: BbPluginApi) {
         "Give directly-dispatched work its own worktree (used only when Chief isn't available)",
       default: true,
     },
+    // Chief's own settings, folded in when the two plugins merged back into one.
+    chiefProject: {
+      type: "project",
+      label: "Where Chief's own thread lives",
+    },
+    architectWorktree: {
+      type: "boolean",
+      label: "Give each task architect its own worktree",
+      default: true,
+    },
+    hideSubordinateThreads: {
+      type: "boolean",
+      label:
+        "Keep project chiefs and task architects out of the sidebar (this panel and their tasks still list them)",
+      default: true,
+    },
+    hideChiefThread: {
+      type: "boolean",
+      label:
+        "Keep the Chief thread itself out of the sidebar (the Chief panel is then its only entry point, and it stops contributing unread badges)",
+      default: true,
+    },
+    architectTitlePrefix: {
+      type: "boolean",
+      label: "Prefix architect thread titles with the task key",
+      default: true,
+    },
   });
 
   const db = bb.storage.database();
@@ -837,13 +932,755 @@ export default async function plugin(bb: BbPluginApi) {
     // Which threads archiving this card archived, so unarchiving it can bring
     // them back rather than leaving them archived with no way back from here.
     `ALTER TABLE archived_cards ADD COLUMN thread_ids TEXT`,
-    // Which chief-nav workflow (bb chief workflow list) this request's
+    // Which workflow (bb command-center workflow list) this request's
     // architect should follow, if any.
     `ALTER TABLE requests ADD COLUMN workflow_name TEXT`,
+    // Chief merges back in as one plugin. The tables below existed once
+    // before, from the first merge attempt, but drifted out of step with
+    // this array's own bookkeeping when the two plugins split apart and
+    // back again — dropped and recreated clean rather than reconciled,
+    // since org bookkeeping (who is whose project chief, which architect
+    // owns which task) is fully re-derivable from BB's own live threads and
+    // Tasks data; nothing here is a record of work, only a cache of it.
+    `DROP TABLE IF EXISTS chiefs`,
+    `DROP TABLE IF EXISTS chief`,
+    `DROP TABLE IF EXISTS project_chiefs`,
+    `DROP TABLE IF EXISTS architects`,
+    `CREATE TABLE IF NOT EXISTS chief (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       thread_id TEXT NOT NULL,
+       project_id TEXT NOT NULL,
+       created_at INTEGER NOT NULL
+     )`,
+    `CREATE TABLE IF NOT EXISTS project_chiefs (
+       project_id TEXT PRIMARY KEY,
+       thread_id TEXT NOT NULL,
+       charter TEXT,
+       created_at INTEGER NOT NULL,
+       retired INTEGER NOT NULL DEFAULT 0
+     )`,
+    `CREATE TABLE IF NOT EXISTS architects (
+       thread_id TEXT PRIMARY KEY,
+       project_id TEXT NOT NULL,
+       chief_thread_id TEXT,
+       parent_thread_id TEXT,
+       task_key TEXT,
+       title TEXT NOT NULL,
+       mission TEXT,
+       created_at INTEGER NOT NULL,
+       retired INTEGER NOT NULL DEFAULT 0
+     )`,
+    `CREATE INDEX IF NOT EXISTS architects_project ON architects (project_id, created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS workflows (
+       id TEXT PRIMARY KEY,
+       name TEXT NOT NULL UNIQUE,
+       created_at INTEGER NOT NULL,
+       updated_at INTEGER NOT NULL
+     )`,
+    `CREATE TABLE IF NOT EXISTS workflow_steps (
+       id TEXT PRIMARY KEY,
+       workflow_id TEXT NOT NULL,
+       position INTEGER NOT NULL,
+       name TEXT NOT NULL,
+       instructions TEXT NOT NULL,
+       provider_id TEXT,
+       model TEXT
+     )`,
+    `CREATE INDEX IF NOT EXISTS workflow_steps_workflow ON workflow_steps (workflow_id, position)`,
   ]);
 
   function publish(): void {
     bb.realtime.publish("changed", { at: Date.now() });
+  }
+
+  // ---------------------------------------------------------------- chief
+  // Ported in when chief-nav merged back into this plugin: one global Chief,
+  // a project chief per project, task architects beneath them. Everything
+  // here used to be cross-plugin rpc; it is all in-process now.
+
+  const CHIEF_BOOTSTRAP_PROMPT = "Chief";
+
+  const handoffParams = z.object({
+    taskKey: z
+      .string()
+      .min(1)
+      .describe(
+        "The BB task this architect owns, e.g. BBC-12. Create it with `bb tasks create` FIRST — a handoff without a task is not allowed.",
+      ),
+    title: z
+      .string()
+      .min(1)
+      .describe("Short title for the architect thread, without the task key."),
+    mission: z
+      .string()
+      .min(1)
+      .describe(
+        "The brief: what outcome this architect owns and why, in enough detail that it never has to ask what the task means.",
+      ),
+    successCriteria: z
+      .array(z.string())
+      .optional()
+      .describe("Observable conditions that mean the task is done."),
+    constraints: z
+      .array(z.string())
+      .optional()
+      .describe("Boundaries: what not to touch, required approach, invariants."),
+    providerId: z
+      .string()
+      .optional()
+      .describe(
+        "Harness to run the architect on (e.g. claude-code, codex). Omit to use whatever the Captain selected in the command center.",
+      ),
+    model: z
+      .string()
+      .optional()
+      .describe("Model for that harness. Omit to use the Captain's command centre selection."),
+    context: z
+      .string()
+      .optional()
+      .describe("Prior decisions, links, thread ids, files worth reading first."),
+    projectId: z
+      .string()
+      .optional()
+      .describe("Defaults to the calling thread's project."),
+    environment: z
+      .enum(["worktree", "project-default"])
+      .optional()
+      .describe(
+        "Workspace for the architect. Defaults to the plugin setting (worktree for PR-producing work).",
+      ),
+    workflowName: z
+      .string()
+      .optional()
+      .describe(
+        "Name of a workflow (bb command-center workflow list) whose steps get folded into the architect's brief. Omit for a plain one-shot task with no protocol.",
+      ),
+  });
+
+  const projectChiefParams = z.object({
+    projectId: z
+      .string()
+      .min(1)
+      .describe("BB project id (proj_…) this chief owns. Use chief_roster to list projects."),
+    charter: z
+      .string()
+      .min(1)
+      .describe(
+        "What this project chief owns: the product, its current priorities, the standards it holds, and anything it must never do. It reads this once, at birth — make it complete.",
+      ),
+  });
+
+  interface ChiefRow {
+    thread_id: string;
+    project_id: string;
+    created_at: number;
+  }
+  interface ProjectChiefRow {
+    project_id: string;
+    thread_id: string;
+    charter: string | null;
+    created_at: number;
+    retired: number;
+  }
+  interface ArchitectRow {
+    thread_id: string;
+    project_id: string;
+    chief_thread_id: string | null;
+    task_key: string | null;
+    title: string;
+    mission: string | null;
+    created_at: number;
+    retired: number;
+    parent_thread_id: string | null;
+  }
+
+  const selectArchitects = db.prepare<[string]>(
+    `SELECT * FROM architects WHERE project_id = ? ORDER BY retired ASC, created_at DESC`,
+  );
+
+  const chiefRow = () =>
+    (db.prepare(`SELECT * FROM chief WHERE id = 1`).get() as ChiefRow | undefined) ?? null;
+
+  const projectChiefRow = (projectId: string) =>
+    (db.prepare(`SELECT * FROM project_chiefs WHERE project_id = ?`).get(projectId) as
+      | ProjectChiefRow
+      | undefined) ?? null;
+
+  /**
+   * Role lookups, kept in memory because `bb.agents.configure` is synchronous
+   * and sits on the thread-start path. Rebuilt from the db at load and after
+   * every write, so a reload never loses the mapping.
+   */
+  let chiefThreadId: string | null = null;
+  const projectChiefThreads = new Set<string>();
+  const architectThreads = new Set<string>();
+
+  function reloadRoles(): void {
+    chiefThreadId = chiefRow()?.thread_id ?? null;
+    projectChiefThreads.clear();
+    architectThreads.clear();
+    for (const row of db.prepare(`SELECT thread_id FROM project_chiefs`).all() as {
+      thread_id: string;
+    }[]) {
+      projectChiefThreads.add(row.thread_id);
+    }
+    for (const row of db.prepare(`SELECT thread_id FROM architects WHERE retired = 0`).all() as {
+      thread_id: string;
+    }[]) {
+      architectThreads.add(row.thread_id);
+    }
+  }
+  reloadRoles();
+
+  const publishChief = () => bb.realtime.publish("state", { changedAt: Date.now() });
+
+  function recordChief(threadId: string, projectId: string): void {
+    db.prepare(
+      `INSERT INTO chief (id, thread_id, project_id, created_at) VALUES (1, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET thread_id = excluded.thread_id,
+                                     project_id = excluded.project_id`,
+    ).run(threadId, projectId, Date.now());
+    reloadRoles();
+    publishChief();
+  }
+
+  function recordProjectChief(projectId: string, threadId: string, charter: string): void {
+    db.prepare(
+      `INSERT INTO project_chiefs (project_id, thread_id, charter, created_at, retired)
+       VALUES (?, ?, ?, ?, 0)
+       ON CONFLICT(project_id) DO UPDATE SET thread_id = excluded.thread_id,
+         charter = excluded.charter, retired = 0`,
+    ).run(projectId, threadId, charter, Date.now());
+    reloadRoles();
+    publishChief();
+  }
+
+  function recordArchitect(row: Omit<ArchitectRow, "retired">): void {
+    db.prepare(
+      `INSERT INTO architects (thread_id, project_id, chief_thread_id, parent_thread_id,
+                               task_key, title, mission, created_at, retired)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+       ON CONFLICT(thread_id) DO UPDATE SET task_key = excluded.task_key,
+         title = excluded.title, mission = excluded.mission,
+         parent_thread_id = excluded.parent_thread_id, retired = 0`,
+    ).run(
+      row.thread_id,
+      row.project_id,
+      row.chief_thread_id,
+      row.parent_thread_id,
+      row.task_key,
+      row.title,
+      row.mission,
+      row.created_at,
+    );
+    reloadRoles();
+    publishChief();
+  }
+
+  function chiefWorkflowRow(name: string): { id: string; created_at: number } | undefined {
+    return db
+      .prepare<[string], { id: string; created_at: number }>(
+        `SELECT id, created_at FROM workflows WHERE name = ?`,
+      )
+      .get(name);
+  }
+
+  function chiefWorkflowSteps(workflowId: string): WorkflowStep[] {
+    return db
+      .prepare<
+        [string],
+        { name: string; instructions: string; provider_id: string | null; model: string | null }
+      >(
+        `SELECT name, instructions, provider_id, model FROM workflow_steps
+           WHERE workflow_id = ? ORDER BY position ASC`,
+      )
+      .all(workflowId)
+      .map((row) => ({
+        name: row.name,
+        instructions: row.instructions,
+        ...(row.provider_id !== null ? { providerId: row.provider_id } : {}),
+        ...(row.model !== null ? { model: row.model } : {}),
+      }));
+  }
+
+  interface WorkflowStep {
+    name: string;
+    instructions: string;
+    providerId?: string;
+    model?: string;
+  }
+  interface Workflow {
+    id: string;
+    name: string;
+    steps: WorkflowStep[];
+    createdAt: number;
+    updatedAt: number;
+  }
+
+  function getWorkflowByName(name: string): Workflow | null {
+    const row = chiefWorkflowRow(name);
+    if (!row) return null;
+    return {
+      id: row.id,
+      name,
+      steps: chiefWorkflowSteps(row.id),
+      createdAt: row.created_at,
+      updatedAt: row.created_at,
+    };
+  }
+
+  function listChiefWorkflows(): { id: string; name: string; stepCount: number }[] {
+    return db
+      .prepare<[], { id: string; name: string; step_count: number }>(
+        `SELECT w.id, w.name, COUNT(s.id) AS step_count
+           FROM workflows w LEFT JOIN workflow_steps s ON s.workflow_id = w.id
+          GROUP BY w.id ORDER BY w.name ASC`,
+      )
+      .all()
+      .map((row) => ({ id: row.id, name: row.name, stepCount: row.step_count }));
+  }
+
+  function writeWorkflowSteps(workflowId: string, steps: WorkflowStep[]): void {
+    db.prepare(`DELETE FROM workflow_steps WHERE workflow_id = ?`).run(workflowId);
+    const insert = db.prepare(
+      `INSERT INTO workflow_steps (id, workflow_id, position, name, instructions, provider_id, model)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    );
+    steps.forEach((step, index) => {
+      insert.run(
+        crypto.randomUUID(),
+        workflowId,
+        index,
+        step.name,
+        step.instructions,
+        step.providerId ?? null,
+        step.model ?? null,
+      );
+    });
+  }
+
+  function createChiefWorkflow(name: string, steps: WorkflowStep[]): Workflow {
+    if (chiefWorkflowRow(name)) {
+      throw new Error(`a workflow named "${name}" already exists — use update instead`);
+    }
+    const id = crypto.randomUUID();
+    const now = Date.now();
+    db.prepare(`INSERT INTO workflows (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)`).run(
+      id,
+      name,
+      now,
+      now,
+    );
+    writeWorkflowSteps(id, steps);
+    return { id, name, steps, createdAt: now, updatedAt: now };
+  }
+
+  function updateChiefWorkflowSteps(name: string, steps: WorkflowStep[]): Workflow {
+    const row = chiefWorkflowRow(name);
+    if (!row) throw new Error(`no workflow named "${name}"`);
+    const now = Date.now();
+    db.prepare(`UPDATE workflows SET updated_at = ? WHERE id = ?`).run(now, row.id);
+    writeWorkflowSteps(row.id, steps);
+    return { id: row.id, name, steps, createdAt: row.created_at, updatedAt: now };
+  }
+
+  function deleteChiefWorkflow(name: string): boolean {
+    const row = chiefWorkflowRow(name);
+    if (!row) return false;
+    db.prepare(`DELETE FROM workflow_steps WHERE workflow_id = ?`).run(row.id);
+    db.prepare(`DELETE FROM workflows WHERE id = ?`).run(row.id);
+    return true;
+  }
+
+  function parseWorkflowSteps(json: string): WorkflowStep[] {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(json);
+    } catch {
+      throw new Error("--steps-json is not valid JSON");
+    }
+    const workflowStepSchema = z.object({
+      name: z.string().min(1),
+      instructions: z.string().min(1),
+      providerId: z.string().optional(),
+      model: z.string().optional(),
+    });
+    const result = z.array(workflowStepSchema).min(1).safeParse(parsed);
+    if (!result.success) {
+      throw new Error(
+        `--steps-json must be a non-empty array of {name, instructions, providerId?, model?}: ${result.error.message}`,
+      );
+    }
+    return result.data;
+  }
+
+  /** Rendered into an architect's brief; empty string when no workflow applies. */
+  function renderWorkflow(workflow: Workflow, ownProviderId: string | null): string {
+    const steps = workflow.steps
+      .map((step, index) => {
+        const harness = [step.providerId ?? null, step.model ?? null]
+          .filter((part): part is string => part !== null)
+          .join("/");
+        const delegates = step.providerId !== undefined && step.providerId !== ownProviderId;
+        const spawnCmd = delegates
+          ? `\`bb thread spawn --parent-self --project "$BB_PROJECT_ID" --provider ${step.providerId}${
+              step.model !== undefined ? ` --model ${step.model}` : ""
+            } --prompt "<this step's instructions plus whatever context it needs>"\`, then \`bb thread wait <id>\` and \`bb thread output <id>\` to read its result before continuing.`
+          : null;
+        return [
+          `${index + 1}. **${step.name}**${
+            harness !== ""
+              ? delegates
+                ? ` — run on ${harness}`
+                : ` — this is your own harness (${harness}); do it directly`
+              : ""
+          }`,
+          `   ${step.instructions}`,
+          ...(spawnCmd !== null ? [`   Run it: ${spawnCmd}`] : []),
+        ].join("\n");
+      })
+      .join("\n");
+    return [
+      `## Workflow: ${workflow.name}`,
+      "Follow these steps in order. A step naming no harness, or naming the harness you already run on, is yours to do directly. A step naming a different harness is a real child thread on that harness, spawned with the exact command given for it — you stay the one continuous thread; wait for the child, read its output, then move to the next step.",
+      "",
+      steps,
+    ].join("\n");
+  }
+
+  /** Live status for a thread; null when it is gone or unreadable. */
+  async function statusOf(threadId: string) {
+    try {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return {
+        status: thread.status as z.infer<typeof threadStatus>,
+        title: thread.title ?? null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async function listChiefProjects() {
+    return (await bb.sdk.projects.list({ includePersonal: true })).map((project) => ({
+      id: project.id,
+      name: project.name,
+      kind: project.kind,
+    }));
+  }
+
+  /** Where Chief's own thread lives: the setting, else Personal, else the first. */
+  async function chiefHomeProject() {
+    const { chiefProject } = await settings.get();
+    const projects = await listChiefProjects();
+    if (chiefProject && projects.some((entry) => entry.id === chiefProject)) {
+      return chiefProject;
+    }
+    return projects.find((entry) => entry.kind === "personal")?.id ?? projects[0]?.id ?? null;
+  }
+
+  const chiefBullets = (items?: string[]) =>
+    items && items.length > 0
+      ? items.map((entry) => `- ${entry}`).join("\n")
+      : "- (none stated — use your judgment and say so in your first report)";
+
+  /** The frame every project chief starts with. */
+  function projectChiefBrief(input: {
+    projectName: string;
+    charter: string;
+    chiefThreadId: string | null;
+  }) {
+    return [
+      `You are the **project chief** for ${input.projectName}. Chief stood you up and manages you; you own this project's execution.`,
+      "",
+      "## Charter",
+      input.charter,
+      "",
+      "## Chain of command",
+      "- The Captain (the user) talks only to Chief. **Never** address the Captain directly.",
+      `- You report to Chief${input.chiefThreadId ? ` (thread ${input.chiefThreadId})` : ""}. Chief decides what reaches the Captain.`,
+      "- You do orchestration for this project, not the work itself. For each unit of work: create the BB task, then hand it to a task architect with `chief_handoff`, then track it.",
+      "- You cannot create other project chiefs. If this work belongs to a different project, say so and let Chief place it.",
+      "",
+      "## The loop",
+      "1. `bb tasks create --title \"…\" --description \"…\" --json` → note the key.",
+      "2. `chief_handoff` with the task key plus mission, success criteria, constraints, and context.",
+      "3. `bb tasks attach <key> --thread <architect-thread-id>` so the board matches reality.",
+      "4. Track with `chief_roster`; keep task status current; never merge a PR.",
+      "",
+      "## When you need the Captain",
+      "- Decisions go through the Inbox with a recommendation and 2–3 choices: `bb command-center ask --task \"<key>\" --task-key \"<key>\" --question \"…\" --option \"…\" --option \"…\" --asked-by \"project chief: " +
+        `${input.projectName}"\`. **--task-key is what puts this on the right card** — --task alone is just a label, and the item shows up as its own separate card instead of attaching to the one already on the board.`,
+      "- For something they should look at, point at the thread: `bb command-center review --task \"<key>\" --task-key \"<key>\" --question \"…\" --thread <thread-id>`. Same reason — --task-key, always.",
+      "",
+      "Report in precise Markdown bullets: verdict or recommendation first, then blockers, evidence, next action, and any decision you need.",
+      "",
+      "Acknowledge with your read of the charter in five bullets or fewer, then wait for work.",
+    ].join("\n");
+  }
+
+  /** The frame every task architect starts with. */
+  function architectBrief(input: {
+    taskKey: string;
+    title: string;
+    mission: string;
+    successCriteria?: string[];
+    constraints?: string[];
+    context?: string;
+    projectName: string;
+    workflow?: Workflow;
+    ownProviderId?: string | null;
+  }) {
+    return [
+      `You are a **task architect** on ${input.projectName}, working task **${input.taskKey}**: ${input.title}.`,
+      "",
+      "The project chief delegated this to you and owns the reporting line upward. You are this task's assigned owner — its chief, in miniature — and you own the outcome end to end.",
+      "",
+      "That does not mean doing every step yourself: do it directly when it is small enough, or fan out to multiple subagents in parallel for independent sub-pieces while you own the architecture, sequencing, and verification. Either way you stay the single accountable thread — verify every delegate's work before it counts as done.",
+      "",
+      "## Mission",
+      input.mission,
+      "",
+      "## Done means",
+      chiefBullets(input.successCriteria),
+      "",
+      "## Constraints",
+      chiefBullets(input.constraints),
+      ...(input.context ? ["", "## Context", input.context] : []),
+      ...(input.workflow ? ["", renderWorkflow(input.workflow, input.ownProviderId ?? null)] : []),
+      "",
+      "## Protocol",
+      `- Keep task ${input.taskKey} current: \`bb tasks update ${input.taskKey} --status <status>\`, and \`bb tasks comment ${input.taskKey}\` for decisions worth keeping.`,
+      "- Never message the Captain directly. If you need a decision, an approval, or a missing value, ask through the Inbox: `bb command-center ask --task " +
+        `"${input.taskKey}" --task-key "${input.taskKey}" --question "..." --option A --option B --asked-by "architect: ${input.taskKey}"\`. Recommend an option; do not stall.`,
+      `- When something needs the Captain's eyes, point at the thread instead of pasting it: \`bb command-center review --task "${input.taskKey}" --task-key "${input.taskKey}" --question "..." --thread <thread-id> --asked-by "architect: ${input.taskKey}"\`.`,
+      `- **Always pass --task-key "${input.taskKey}"** on both — it is what attaches your question to this task's card on the Captain's board rather than spawning a second, separate one for the same work.`,
+      "- Fan out to subagents (in parallel, for independent sub-pieces) whenever that finishes it faster than doing it alone — keep the architecture, sequencing, and verification yours, and none of them talks to the Captain.",
+      "- Report in precise Markdown bullets, led by the verdict or recommendation, then blockers, evidence, and next action.",
+      "",
+      "Start by restating the plan in five bullets or fewer, then begin.",
+    ].join("\n");
+  }
+
+  async function resolveChiefProjectName(projectId: string) {
+    try {
+      return (await bb.sdk.projects.get({ projectId })).name;
+    } catch {
+      try {
+        const match = (await listChiefProjects()).find((project) => project.id === projectId);
+        if (match) return match.name;
+      } catch {
+        // Both lookups failed; the caller gets a generic name below.
+      }
+      return "this project";
+    }
+  }
+
+  /** Create the one global Chief thread and bootstrap it with its contract. */
+  async function ensureChief() {
+    const existing = chiefRow();
+    if (existing) {
+      if (await statusOf(existing.thread_id)) {
+        return { threadId: existing.thread_id, created: false };
+      }
+      db.prepare(`DELETE FROM chief WHERE id = 1`).run();
+      reloadRoles();
+    }
+    const projectId = await chiefHomeProject();
+    if (!projectId) {
+      throw new Error("no BB project available to hold the Chief thread");
+    }
+    const { hideChiefThread } = await settings.get();
+    const thread = await bb.sdk.threads.spawn({
+      projectId,
+      environment: { type: "project-default" },
+      title: "Chief",
+      ...(hideChiefThread ? { visibility: "hidden" as const } : {}),
+      prompt: CHIEF_BOOTSTRAP_PROMPT,
+    });
+    recordChief(thread.id, projectId);
+    bb.log.info(`chief thread ${thread.id} created in ${projectId}`);
+    return { threadId: thread.id, created: true };
+  }
+
+  /** Stand up (or return) the project chief for one project. */
+  async function ensureProjectChief(params: z.infer<typeof projectChiefParams>) {
+    const existing = projectChiefRow(params.projectId);
+    if (existing && (await statusOf(existing.thread_id))) {
+      return { threadId: existing.thread_id, created: false, projectId: params.projectId };
+    }
+    const projectName = await resolveChiefProjectName(params.projectId);
+    const { hideSubordinateThreads } = await settings.get();
+    const thread = await bb.sdk.threads.spawn({
+      projectId: params.projectId,
+      title: `Project chief — ${projectName}`,
+      ...(hideSubordinateThreads ? { visibility: "hidden" as const } : {}),
+      environment: { type: "project-default" },
+      prompt: projectChiefBrief({ projectName, charter: params.charter, chiefThreadId }),
+    });
+    recordProjectChief(params.projectId, thread.id, params.charter);
+    bb.log.info(`project chief ${thread.id} created for ${params.projectId}`);
+    return { threadId: thread.id, created: true, projectId: params.projectId };
+  }
+
+  async function handoff(params: z.infer<typeof handoffParams>, callerThreadId: string | null) {
+    const { architectWorktree, architectTitlePrefix, hideSubordinateThreads } =
+      await settings.get();
+    let projectId = params.projectId;
+    if (!projectId && callerThreadId) {
+      projectId = (await bb.sdk.threads.get({ threadId: callerThreadId })).projectId;
+    }
+    if (!projectId) {
+      throw new Error("no project — pass projectId (the calling thread has none)");
+    }
+
+    const registeredProjectChief = projectChiefRow(projectId)?.thread_id ?? null;
+    const reportsTo =
+      callerThreadId && projectChiefThreads.has(callerThreadId)
+        ? callerThreadId
+        : (registeredProjectChief ?? chiefThreadId);
+
+    const workspace =
+      params.environment ?? (architectWorktree ? "worktree" : "project-default");
+    const title = architectTitlePrefix ? `${params.taskKey} — ${params.title}` : params.title;
+    let workflow: Workflow | undefined;
+    if (params.workflowName !== undefined) {
+      const found = getWorkflowByName(params.workflowName);
+      if (!found) {
+        throw new Error(
+          `no workflow named "${params.workflowName}" — see \`bb command-center workflow list\``,
+        );
+      }
+      workflow = found;
+    }
+    const primaryStep = workflow?.steps[0];
+    const preferred = await dispatchPreferenceFor(params.taskKey ?? null);
+    const providerId = primaryStep?.providerId ?? params.providerId ?? preferred.providerId;
+    const model =
+      primaryStep?.providerId !== undefined
+        ? (primaryStep.model ?? null)
+        : (params.model ?? preferred.model);
+    const thread = await bb.sdk.threads.spawn({
+      projectId,
+      title,
+      ...(providerId !== null ? { providerId } : {}),
+      ...(model !== null ? { model } : {}),
+      ...(hideSubordinateThreads ? { visibility: "hidden" as const } : {}),
+      environment:
+        workspace === "worktree"
+          ? {
+              type: "host" as const,
+              hostId: await defaultHostId(),
+              workspace: {
+                type: "managed-worktree" as const,
+                baseBranch: { kind: "default" as const },
+              },
+            }
+          : { type: "project-default" as const },
+      prompt: architectBrief({
+        ...params,
+        projectName: await resolveChiefProjectName(projectId),
+        workflow,
+        ownProviderId: providerId,
+      }),
+    });
+
+    recordArchitect({
+      thread_id: thread.id,
+      project_id: projectId,
+      chief_thread_id: chiefThreadId,
+      parent_thread_id: reportsTo,
+      task_key: params.taskKey,
+      title: params.title,
+      mission: params.mission,
+      created_at: Date.now(),
+    });
+    bb.log.info(
+      `handed ${params.taskKey} to task architect ${thread.id}${providerId !== null ? ` on ${providerId}` : ""}`,
+    );
+    return { threadId: thread.id, projectId, title, providerId, model };
+  }
+
+  /** The whole org, with live thread status. Shared by rpc, tools, and cli. */
+  async function roster() {
+    const chief = chiefRow();
+    const chiefLive = chief ? await statusOf(chief.thread_id) : null;
+    const projects = await listChiefProjects();
+    const groups: z.infer<typeof projectGroup>[] = [];
+
+    for (const project of projects) {
+      const row = projectChiefRow(project.id);
+      if (!row) continue;
+      const live = await statusOf(row.thread_id);
+      if (!live) continue;
+      const architects = await Promise.all(
+        (selectArchitects.all(project.id) as ArchitectRow[]).map(async (architect) => {
+          const architectLive = await statusOf(architect.thread_id);
+          return {
+            threadId: architect.thread_id,
+            title: architectLive?.title ?? architect.title,
+            status: architectLive?.status ?? null,
+            taskKey: architect.task_key,
+            subtitle: architect.mission,
+            retired: architect.retired === 1,
+            createdAt: architect.created_at,
+          };
+        }),
+      );
+      groups.push({
+        projectId: project.id,
+        projectName: project.name,
+        chief: {
+          threadId: row.thread_id,
+          title: live.title ?? `Project chief — ${project.name}`,
+          status: live.status,
+          taskKey: null,
+          subtitle: project.name,
+          retired: row.retired === 1,
+          createdAt: row.created_at,
+        },
+        architects: architects.filter((entry) => entry.status !== null),
+      });
+    }
+
+    return {
+      chief:
+        chief && chiefLive
+          ? {
+              threadId: chief.thread_id,
+              title: chiefLive.title ?? "Chief",
+              status: chiefLive.status,
+              taskKey: null,
+              subtitle: null,
+              retired: false,
+              createdAt: chief.created_at,
+            }
+          : null,
+      chiefProjectId: chief?.project_id ?? null,
+      groups,
+      projects,
+    };
+  }
+
+  /** Open questions, for the Chief nav rail — this plugin's own `listItems()` now. */
+  function chiefNeedsInput(): {
+    items: z.infer<typeof chiefNeedsInputItem>[];
+    error: string | null;
+  } {
+    const { open } = listItems();
+    return {
+      items: open.map((item) => ({
+        id: item.id,
+        question: item.question,
+        task: item.task,
+        taskKey: item.taskKey,
+        askedBy: item.askedBy,
+        urgent: item.urgent,
+        reviewThreadId: item.reviewThreadId,
+        askerThreadId: item.threadId,
+      })),
+      error: null,
+    };
   }
 
   // ------------------------------------------------------------ item reads
@@ -902,6 +1739,11 @@ export default async function plugin(bb: BbPluginApi) {
     notify: boolean;
   }): string {
     const id = newId("inbx");
+    // Belt-and-suspenders: the CLI already rejects a non-http(s) --url, but
+    // this is the one place anything ever reaches the column that becomes
+    // an <a href>, so it stays safe even if a future caller forgets to check.
+    const reviewUrl =
+      input.reviewUrl !== null && isHttpUrl(input.reviewUrl) ? input.reviewUrl : null;
     db.prepare(
       `INSERT INTO items (
          id, created_at, task, question, kind, options, placeholder, task_key,
@@ -922,7 +1764,7 @@ export default async function plugin(bb: BbPluginApi) {
       input.notify ? 1 : 0,
       input.askedBy,
       input.reviewThreadId,
-      input.reviewUrl,
+      reviewUrl,
       input.urgent ? 1 : 0,
     );
     publish();
@@ -1213,15 +2055,14 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * Command Center leans on two companion plugins it does not bundle: BB's
+   * Command Center leans on one companion plugin it does not bundle: BB's
    * own Tasks plugin (task keys, comments, board status — almost everything
-   * task-related goes through it) and chief-nav (routes dispatched work
-   * through an org instead of a flat worker thread). Neither is declared
-   * anywhere in the manifest — there is no such field — so a fresh install
-   * of this plugin alone leaves both silently missing until something tries
-   * to use them and fails. Installing them here, once, closes that gap.
-   * Both stay genuinely optional: dispatch and wake-up already fall back to
-   * spawning a worker thread directly when chief-nav is not reachable.
+   * task-related goes through it). It is not declared anywhere in the
+   * manifest — there is no such field — so a fresh install of this plugin
+   * alone leaves it silently missing until something tries to use it and
+   * fails. Installing it here, once, closes that gap. Chief's org (Chief,
+   * project chiefs, task architects) is native to this plugin now, so it
+   * needs no separate install.
    */
   async function ensureCompanionPlugins(): Promise<void> {
     let ids: Set<string>;
@@ -1239,22 +2080,175 @@ export default async function plugin(bb: BbPluginApi) {
         bb.log.warn(`could not auto-install the Tasks plugin: ${String(error)}`);
       }
     }
-    if (!ids.has("chief-nav")) {
-      try {
-        await bb.sdk.plugins.install({
-          source: "git:https://github.com/dilipgv/bb-plugin-chief-nav.git@^0.1.0",
-        });
-        bb.log.info("installed the chief-nav companion plugin");
-      } catch (error) {
-        bb.log.warn(`could not auto-install chief-nav: ${String(error)}`);
-      }
-    }
   }
 
   bb.background.service("ensure-companions", {
     async start() {
       await ensureCompanionPlugins();
     },
+  });
+
+  // The rail shows live thread status, so every lifecycle transition of a
+  // thread we track is a reason to refetch.
+  const republishIfTracked = ({ thread }: { thread: { id: string } }) => {
+    if (
+      thread.id === chiefThreadId ||
+      projectChiefThreads.has(thread.id) ||
+      architectThreads.has(thread.id)
+    ) {
+      publish();
+    }
+  };
+  bb.events.on("thread.active", republishIfTracked);
+  bb.events.on("thread.idle", republishIfTracked);
+  bb.events.on("thread.failed", republishIfTracked);
+  bb.events.on("thread.archived", republishIfTracked);
+  bb.events.on("thread.deleted", ({ thread }) => {
+    db.prepare(`DELETE FROM architects WHERE thread_id = ?`).run(thread.id);
+    db.prepare(`DELETE FROM project_chiefs WHERE thread_id = ?`).run(thread.id);
+    db.prepare(`DELETE FROM chief WHERE thread_id = ?`).run(thread.id);
+    reloadRoles();
+    publish();
+  });
+
+  // ------------------------------------------------------------------ agents
+
+  bb.agents.registerTool({
+    name: "chief_project_chief",
+    description:
+      "Stand up (or return) the project chief that owns one BB project, briefed with a charter. Chief-only: this is how Chief delegates a whole project rather than a single task.",
+    instructions:
+      "Chief never works a project directly. Give each project a project chief with chief_project_chief, then send work to that thread.",
+    presentation: {
+      label: { pending: "Standing up a project chief", completed: "Stood up a project chief" },
+    },
+    parameters: projectChiefParams,
+    async execute(params) {
+      const result = await ensureProjectChief(params);
+      return result.created
+        ? `Project chief for ${params.projectId} is thread ${result.threadId}. Send it work with \`bb thread tell ${result.threadId} "…"\`; it creates the tasks and hands them to task architects.`
+        : `Project chief for ${params.projectId} already exists: thread ${result.threadId}.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "chief_handoff",
+    description:
+      "Hand a BB task to a freshly spawned task architect with a complete brief. That architect becomes the task's assigned owner — its chief — free to do the work directly or fan out to delegates it coordinates, while staying the one accountable thread. Requires an existing task key — create it with `bb tasks create` first. Returns the architect thread id.",
+    instructions:
+      "Delegate with chief_handoff instead of doing the work yourself. It composes the architect's brief from your mission/criteria/constraints, spawns the thread under you, and registers it in the Chief nav.",
+    presentation: {
+      label: { pending: "Handing off to a task architect", completed: "Handed off to a task architect" },
+    },
+    parameters: handoffParams,
+    async execute(params, ctx) {
+      const result = await handoff(params, ctx.threadId ?? null);
+      return [
+        `Handed ${params.taskKey} to task architect thread ${result.threadId} ("${result.title}")${
+          result.providerId !== null
+            ? ` on ${result.providerId}${result.model !== null ? ` / ${result.model}` : ""}`
+            : ""
+        }.`,
+        `Attach it to the task so the board reflects reality: \`bb tasks attach ${params.taskKey} --thread ${result.threadId}\`.`,
+        "It reports back here; escalate only decisions and blockers upward.",
+      ].join("\n");
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "chief_roster",
+    description:
+      "The live org: BB projects, their project chiefs, each chief's task architects with thread status, and everything currently waiting on the Captain. Use it instead of memory to build a digest.",
+    presentation: {
+      label: { pending: "Reading the Chief roster", completed: "Read the Chief roster" },
+    },
+    parameters: z.object({
+      projectId: z
+        .string()
+        .optional()
+        .describe("Limit to one project. Omit for the whole org."),
+    }),
+    async execute({ projectId }) {
+      const [{ chief, groups, projects }, inbox] = await Promise.all([
+        roster(),
+        Promise.resolve(chiefNeedsInput()),
+      ]);
+      const scoped = projectId
+        ? groups.filter((group) => group.projectId === projectId)
+        : groups;
+      const lines: string[] = [
+        `Chief: ${chief ? `${chief.threadId} [${chief.status}]` : "not started"}`,
+      ];
+      if (!projectId) {
+        const unmanaged = projects.filter(
+          (project) =>
+            !groups.some((group) => group.projectId === project.id),
+        );
+        lines.push(
+          unmanaged.length === 0
+            ? "Every project has a chief."
+            : `Projects with no chief yet: ${unmanaged
+                .map((project) => `${project.name} (${project.id})`)
+                .join(", ")}`,
+        );
+      }
+      for (const group of scoped) {
+        lines.push(
+          "",
+          `${group.projectName} (${group.projectId})`,
+          `  project chief: ${group.chief.threadId} [${group.chief.status}]${
+            group.chief.retired ? " (retired)" : ""
+          }`,
+        );
+        if (group.architects.length === 0) {
+          lines.push("  architects: none");
+        }
+        for (const architect of group.architects) {
+          lines.push(
+            `  ${architect.taskKey ?? "(no task)"}  ${architect.title}  [${
+              architect.status
+            }${architect.retired ? ", retired" : ""}]  ${architect.threadId}`,
+          );
+        }
+      }
+      if (inbox.items.length > 0) {
+        lines.push("", "Waiting on the Captain:");
+        for (const item of inbox.items) {
+          lines.push(
+            `- [${item.taskKey ?? item.task}] ${item.question}${
+              item.askedBy ? ` (${item.askedBy})` : ""
+            } — inbox ${item.id}`,
+          );
+        }
+      }
+      return lines.join("\n");
+    },
+  });
+
+  // Role-aware sessions. Each tier gets exactly the skill and the tools its
+  // level of the hierarchy is allowed to use, so the chain of command cannot
+  // invert itself: only Chief creates project chiefs, only project chiefs and
+  // Chief hand off tasks, architects delegate to subagents and report upward.
+  bb.agents.configure((context) => {
+    if (context.thread.id === chiefThreadId) {
+      return {
+        tools: ["chief_project_chief", "chief_roster"],
+        skills: ["chief"],
+        instructions:
+          "You are Chief — the Captain's only conversation, and the single Chief for every project. Delegate whole projects to project chiefs; never work a task yourself.",
+      };
+    }
+    if (projectChiefThreads.has(context.thread.id)) {
+      return {
+        tools: ["chief_handoff", "chief_roster"],
+        skills: ["project-chief"],
+        instructions: `You are the project chief for ${context.project.name}. You report to Chief; the Captain is not in this thread.`,
+      };
+    }
+    if (architectThreads.has(context.thread.id)) {
+      return { tools: ["chief_roster"], skills: ["chief-architect"] };
+    }
+    return { tools: [], skills: [] };
   });
 
   bb.background.service("notify-watch", {
@@ -1416,27 +2410,16 @@ export default async function plugin(bb: BbPluginApi) {
    * Chief's own thread plus every project chief's — the org's long-lived
    * leadership threads, never a per-task worker. Archiving a card can archive
    * the threads that were doing that one piece of work, but it must never take
-   * out the thread the whole org is running through. Tolerant of chief-nav
-   * being absent: nothing gets excluded, since there is nothing to protect.
+   * out the thread the whole org is running through. Tolerant of Chief not
+   * having been started yet: nothing gets excluded, since there is nothing
+   * to protect.
    */
   async function protectedOrgThreadIds(): Promise<Set<string>> {
     try {
-      const state = await bb.sdk.plugins.callRpc({
-        pluginId: "chief-nav",
-        method: "state",
-        input: null,
-        outputSchema: z.looseObject({
-          chief: z.looseObject({ threadId: z.string() }).nullable(),
-          groups: z.array(
-            z.looseObject({
-              chief: z.looseObject({ threadId: z.string() }),
-            }),
-          ),
-        }),
-      });
+      const { chief, groups } = await roster();
       const ids = new Set<string>();
-      if (state.chief !== null) ids.add(state.chief.threadId);
-      for (const group of state.groups) ids.add(group.chief.threadId);
+      if (chief !== null) ids.add(chief.threadId);
+      for (const group of groups) ids.add(group.chief.threadId);
       return ids;
     } catch {
       return new Set();
@@ -1518,10 +2501,9 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * chief-nav's own workflow rendering, duplicated rather than imported since
-   * the two plugins share no code — a workflow named on a request should
-   * still show up in the brief even when Chief itself isn't reachable but
-   * chief-nav's data still is.
+   * A separate rendering from `renderWorkflow` below: a workflow named on a
+   * request should still show up in the brief even when there is no Chief
+   * org to route through and a worker is spawned directly instead.
    */
   interface FetchedWorkflow {
     name: string;
@@ -1571,35 +2553,9 @@ export default async function plugin(bb: BbPluginApi) {
     ].join("\n");
   }
 
-  async function fetchWorkflow(workflowName: string | null): Promise<FetchedWorkflow | null> {
+  function fetchWorkflow(workflowName: string | null): FetchedWorkflow | null {
     if (workflowName === null) return null;
-    try {
-      const result = await bb.sdk.plugins.callRpc({
-        pluginId: "chief-nav",
-        method: "getWorkflow",
-        input: { name: workflowName },
-        outputSchema: z.object({
-          workflow: z
-            .object({
-              name: z.string(),
-              steps: z.array(
-                z.object({
-                  name: z.string(),
-                  instructions: z.string(),
-                  providerId: z.string().optional(),
-                  model: z.string().optional(),
-                }),
-              ),
-            })
-            .nullable(),
-        }),
-      });
-      return result.workflow;
-    } catch {
-      // chief-nav is unreachable too — the worker just runs without a named
-      // protocol rather than blocking dispatch on it.
-      return null;
-    }
+    return getWorkflowByName(workflowName);
   }
 
   /** The brief a directly-spawned worker gets for a brand-new request. */
@@ -1626,9 +2582,9 @@ export default async function plugin(bb: BbPluginApi) {
       ...(row.body.trim() !== "" ? ["", row.body.trim()] : []),
       "",
       "No Chief org is reachable right now, so there is nobody to route this to — you are its accountable owner end to end. Do it yourself, or fan out to delegates you coordinate, but stay the one thread the Captain can check on.",
-      `First: \`bb tasks create --title "…" --description "…" --json\` for a task key, then \`bb inbox ack ${row.id} --task-key <key>\` so this lands on the right card, then \`bb tasks attach <key> --thread $BB_THREAD_ID\`.`,
-      `Escalate decisions through the Inbox: \`bb inbox ask --task "<key>" --task-key "<key>" --question "…" --option … --asked-by "worker: <key>"\`. Point at this thread for review: \`bb inbox review --task "<key>" --task-key "<key>" --question "…" --thread $BB_THREAD_ID\`.`,
-      `Close it when it lands or is abandoned: \`bb inbox close ${row.id} --outcome "…"\`.`,
+      `First: \`bb tasks create --title "…" --description "…" --json\` for a task key, then \`bb command-center ack ${row.id} --task-key <key>\` so this lands on the right card, then \`bb tasks attach <key> --thread $BB_THREAD_ID\`.`,
+      `Escalate decisions through the Inbox: \`bb command-center ask --task "<key>" --task-key "<key>" --question "…" --option … --asked-by "worker: <key>"\`. Point at this thread for review: \`bb command-center review --task "<key>" --task-key "<key>" --question "…" --thread $BB_THREAD_ID\`.`,
+      `Close it when it lands or is abandoned: \`bb command-center close ${row.id} --outcome "…"\`.`,
       workflowSection,
     ].join("\n");
   }
@@ -1642,44 +2598,27 @@ export default async function plugin(bb: BbPluginApi) {
       mission,
       "",
       `Attach yourself to the task: \`bb tasks attach ${task.key} --thread $BB_THREAD_ID\`.`,
-      `Escalate decisions: \`bb inbox ask --task "${task.key}" --task-key "${task.key}" --question "…" --option … --asked-by "worker: ${task.key}"\`. Point at this thread for review: \`bb inbox review --task "${task.key}" --task-key "${task.key}" --question "…" --thread $BB_THREAD_ID\`.`,
+      `Escalate decisions: \`bb command-center ask --task "${task.key}" --task-key "${task.key}" --question "…" --option … --asked-by "worker: ${task.key}"\`. Point at this thread for review: \`bb command-center review --task "${task.key}" --task-key "${task.key}" --question "…" --thread $BB_THREAD_ID\`.`,
       `Keep status current: \`bb tasks update ${task.key} --status <status>\`.`,
     ].join("\n");
   }
 
   /**
-   * Where Chief lives. chief-nav owns that fact, so ask it first and fall back
-   * to the setting — this plugin stays useful without chief-nav installed,
-   * exactly as chief-nav stays useful without this one.
+   * Where Chief lives, if it has been started at all — falls back to the
+   * `chiefProject` setting when Chief's bootstrap thread doesn't exist yet,
+   * since dispatch stays useful (via direct spawn) even before Chief is up.
    */
   async function chiefThread(): Promise<{
     threadId: string | null;
     status: string | null;
     error: string | null;
   }> {
-    try {
-      const state = await bb.sdk.plugins.callRpc({
-        pluginId: "chief-nav",
-        method: "state",
-        input: null,
-        outputSchema: z.looseObject({
-          chief: z
-            .looseObject({
-              threadId: z.string(),
-              status: z.string().nullish(),
-            })
-            .nullable(),
-        }),
-      });
-      if (state.chief?.threadId !== undefined) {
-        return {
-          threadId: state.chief.threadId,
-          status: state.chief.status ?? null,
-          error: null,
-        };
+    const chief = chiefRow();
+    if (chief !== null) {
+      const live = await statusOf(chief.thread_id);
+      if (live !== null) {
+        return { threadId: chief.thread_id, status: live.status, error: null };
       }
-    } catch (error) {
-      bb.log.debug(`chief-nav unavailable: ${String(error)}`);
     }
     return {
       threadId: null,
@@ -1716,8 +2655,8 @@ export default async function plugin(bb: BbPluginApi) {
         : "",
       "Route this: decide which project owns it, make sure that project has a chief, and send it down. Do not do the work yourself.",
       "This must end with one accountable owner — a task architect who either does the work directly or fans out to delegates it coordinates — never left as just a reply in this thread.",
-      `Ack it as soon as a task exists: \`bb inbox ack ${row.id} --task-key <key>\`.`,
-      `Close it when it lands or is abandoned: \`bb inbox close ${row.id} --outcome "…"\`.`,
+      `Ack it as soon as a task exists: \`bb command-center ack ${row.id} --task-key <key>\`.`,
+      `Close it when it lands or is abandoned: \`bb command-center close ${row.id} --outcome "…"\`.`,
     ].join("\n");
   }
 
@@ -3183,24 +4122,16 @@ export default async function plugin(bb: BbPluginApi) {
       // dispatch. When it isn't, spawn the replacement worker directly.
       let newThreadId: string;
       try {
-        const handoff = await bb.sdk.plugins.callRpc({
-          pluginId: "chief-nav",
-          method: "handoffTask",
-          input: {
+        const result = await handoff(
+          {
             taskKey: task.key,
             title: task.title,
             mission,
             projectId,
           },
-          outputSchema: z.object({
-            threadId: z.string(),
-            projectId: z.string(),
-            title: z.string(),
-            providerId: z.string().nullable(),
-            model: z.string().nullable(),
-          }),
-        });
-        newThreadId = handoff.threadId;
+          null,
+        );
+        newThreadId = result.threadId;
       } catch (chiefError) {
         try {
           const preferred = await dispatchPreferenceFor(task.key);
@@ -3293,22 +4224,38 @@ export default async function plugin(bb: BbPluginApi) {
         error,
       };
     },
-    async workflows() {
-      try {
-        const result = await bb.sdk.plugins.callRpc({
-          pluginId: "chief-nav",
-          method: "listWorkflows",
-          input: null,
-          outputSchema: z.object({
-            workflows: z.array(
-              z.object({ id: z.string(), name: z.string(), stepCount: z.number() }),
-            ),
-          }),
-        });
-        return { workflows: result.workflows, error: null };
-      } catch (error) {
-        return { workflows: [], error: String(error) };
-      }
+    workflows() {
+      return { workflows: listChiefWorkflows(), error: null };
+    },
+    async state() {
+      const { chief, chiefProjectId, groups } = await roster();
+      const inbox = chiefNeedsInput();
+      return {
+        chief,
+        chiefProjectId,
+        groups,
+        needsInput: inbox.items,
+        needsInputError: inbox.error,
+      };
+    },
+    ensureChief: () => ensureChief(),
+    async adoptChief({ threadId }) {
+      const thread = await bb.sdk.threads.get({ threadId });
+      recordChief(threadId, thread.projectId);
+      return { ok: true };
+    },
+    setRetired({ threadId, retired }) {
+      const value = retired ? 1 : 0;
+      const changed =
+        db
+          .prepare(`UPDATE architects SET retired = ? WHERE thread_id = ?`)
+          .run(value, threadId).changes +
+        db
+          .prepare(`UPDATE project_chiefs SET retired = ? WHERE thread_id = ?`)
+          .run(value, threadId).changes;
+      reloadRoles();
+      publish();
+      return { ok: changed > 0 };
     },
     async setDispatchDefault({ providerId, model }) {
       await bb.storage.kv.set("dispatch-default", {
@@ -3699,7 +4646,7 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   bb.cli.register({
-    name: "inbox",
+    name: "command-center",
     summary:
       "Your command center: the board, the queue, and the questions waiting on you",
     commands: [
@@ -3707,87 +4654,106 @@ export default async function plugin(bb: BbPluginApi) {
         name: "ask",
         summary: "Ask the user a question",
         usage:
-          'bb inbox ask --task "…" --question "…" [--option A --option B | --multi | --input] [--asked-by "…"] [--urgent] [--wait]',
+          'bb command-center ask --task "…" --question "…" [--option A --option B | --multi | --input] [--asked-by "…"] [--urgent] [--wait]',
       },
       {
         name: "review",
         summary: "Ask the user to look at a thread or URL",
         usage:
-          'bb inbox review --task "…" --question "…" --thread <id> | --url <url> [--option Approve]',
+          'bb command-center review --task "…" --question "…" --thread <id> | --url <url> [--option Approve]',
       },
       {
         name: "list",
         summary: "Show the question queue",
-        usage: "bb inbox list [--all] [--json]",
+        usage: "bb command-center list [--all] [--json]",
       },
       {
         name: "get",
         summary: "Read one item",
-        usage: "bb inbox get <id> [--json]",
+        usage: "bb command-center get <id> [--json]",
       },
       {
         name: "wait",
         summary: "Block until an item is answered",
-        usage: "bb inbox wait <id> [--timeout-sec 600] [--json]",
+        usage: "bb command-center wait <id> [--timeout-sec 600] [--json]",
       },
       {
         name: "done",
         summary: "Withdraw a question you no longer need answered",
-        usage: "bb inbox done <id>",
+        usage: "bb command-center done <id>",
       },
       {
         name: "answers",
         summary: "Recently resolved items, for a replacement thread to catch up",
-        usage: "bb inbox answers [--since-min 120] [--json]",
+        usage: "bb command-center answers [--since-min 120] [--json]",
       },
       {
         name: "snooze",
         summary: "Snooze an item on the user's behalf",
-        usage: "bb inbox snooze <id> --hours N | --minutes N | --clear",
+        usage: "bb command-center snooze <id> --hours N | --minutes N | --clear",
       },
       {
         name: "add",
         summary: "Queue a request in the command center",
         usage:
-          'bb inbox add "<title>" [--body "…"] [--project <id>] [--priority low|normal|high] [--urgent]',
+          'bb command-center add "<title>" [--body "…"] [--project <id>] [--priority low|normal|high] [--urgent]',
       },
       {
         name: "queue",
         summary: "Show the command center request lane",
-        usage: "bb inbox queue [--all] [--json]",
+        usage: "bb command-center queue [--all] [--json]",
       },
       {
         name: "ack",
         summary: "Acknowledge a dispatched request with its task key",
-        usage: "bb inbox ack <id> --task-key ABC-12",
+        usage: "bb command-center ack <id> --task-key ABC-12",
       },
       {
         name: "ready",
         summary:
           "Park a request in In review — finished, awaiting the Captain's sign-off",
-        usage: 'bb inbox ready <id> [--outcome "PR #412 is open"]',
+        usage: 'bb command-center ready <id> [--outcome "PR #412 is open"]',
       },
       {
         name: "close",
         summary: "Close a request with an outcome",
-        usage: 'bb inbox close <id> [--outcome "…"] [--cancelled]',
+        usage: 'bb command-center close <id> [--outcome "…"] [--cancelled]',
       },
       {
         name: "dispatch",
         summary: "Send a queued request to Chief (normally the Captain's call)",
-        usage: "bb inbox dispatch <id>",
+        usage: "bb command-center dispatch <id>",
       },
       {
         name: "notify-test",
         summary:
           "Send a test macOS notification, to check the OS is letting them through",
-        usage: "bb inbox notify-test",
+        usage: "bb command-center notify-test",
       },
       {
         name: "voice-parse",
         summary:
           "Show how a spoken phrase parses into a request, without a microphone",
-        usage: 'bb inbox voice-parse "bump the SDK, high priority, dispatch" [--json]',
+        usage: 'bb command-center voice-parse "bump the SDK, high priority, dispatch" [--json]',
+      },
+      {
+        name: "chief",
+        summary:
+          "The Chief org: one global Chief, a project chief per project, task architects beneath them",
+        usage:
+          "bb command-center chief status [--project <proj-id>] [--json]\n" +
+          "bb command-center chief start [--json]\n" +
+          "bb command-center chief adopt --thread thr_abc\n" +
+          'bb command-center chief project-chief --project proj_abc --charter "…" [--json]\n' +
+          'bb command-center chief adopt-project-chief --thread thr_abc [--charter "…"] [--json]\n' +
+          'bb command-center chief handoff --task BBC-12 --title "…" --mission "…" [--criteria "…"]... [--constraint "…"]... [--context "…"] [--workspace worktree|project-default] [--workflow <name>] [--project <proj-id>] [--json]\n' +
+          'bb command-center chief workflow create --name "IMPL" --steps-json \'[{"name":"Plan","instructions":"…"}]\'\n' +
+          "bb command-center chief workflow list [--json]\n" +
+          "bb command-center chief workflow get <name> [--json]\n" +
+          "bb command-center chief workflow update <name> --steps-json '[...]' [--json]\n" +
+          "bb command-center chief workflow delete <name>\n" +
+          "bb command-center chief retire <thread-id> [--undo]\n" +
+          "bb command-center chief tidy [--parent <thread-id>] [--recursive] [--undo] [--json]",
       },
     ],
     async run(argv, ctx) {
@@ -3811,6 +4777,11 @@ export default async function plugin(bb: BbPluginApi) {
               exitCode: 1,
               stderr: "review needs --thread <id> or --url <url>.",
             };
+          }
+          // Rendered later as `<a href={reviewUrl}>` — an unvalidated string
+          // here is a javascript:/file: link away from an XSS-shaped click.
+          if (reviewUrl !== null && !isHttpUrl(reviewUrl)) {
+            return { exitCode: 1, stderr: "--url must be an http(s) URL." };
           }
           const kind = isReview
             ? "review"
@@ -3900,7 +4871,7 @@ export default async function plugin(bb: BbPluginApi) {
         case "get": {
           const id = parsed.positional[0];
           if (id === undefined) {
-            return { exitCode: 1, stderr: "Usage: bb inbox get <id>" };
+            return { exitCode: 1, stderr: "Usage: bb command-center get <id>" };
           }
           const row = getItem(id);
           if (row === undefined) {
@@ -3927,7 +4898,7 @@ export default async function plugin(bb: BbPluginApi) {
         case "wait": {
           const id = parsed.positional[0];
           if (id === undefined) {
-            return { exitCode: 1, stderr: "Usage: bb inbox wait <id>" };
+            return { exitCode: 1, stderr: "Usage: bb command-center wait <id>" };
           }
           const row = await waitForItem(
             id,
@@ -3951,7 +4922,7 @@ export default async function plugin(bb: BbPluginApi) {
         case "done": {
           const id = parsed.positional[0];
           if (id === undefined) {
-            return { exitCode: 1, stderr: "Usage: bb inbox done <id>" };
+            return { exitCode: 1, stderr: "Usage: bb command-center done <id>" };
           }
           if (getItem(id) === undefined) {
             return { exitCode: 1, stderr: `No item ${id}.` };
@@ -3998,7 +4969,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (id === undefined) {
             return {
               exitCode: 1,
-              stderr: "Usage: bb inbox snooze <id> --hours N | --minutes N | --clear",
+              stderr: "Usage: bb command-center snooze <id> --hours N | --minutes N | --clear",
             };
           }
           if (getItem(id) === undefined) {
@@ -4034,7 +5005,7 @@ export default async function plugin(bb: BbPluginApi) {
           const title =
             parsed.positional.join(" ").trim() || (textFlag(parsed, "title") ?? "");
           if (title === "") {
-            return { exitCode: 1, stderr: 'Usage: bb inbox add "<title>"' };
+            return { exitCode: 1, stderr: 'Usage: bb command-center add "<title>"' };
           }
           const id = addRequest({
             title,
@@ -4078,7 +5049,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (id === undefined || taskKey === undefined) {
             return {
               exitCode: 1,
-              stderr: "Usage: bb inbox ack <id> --task-key ABC-12",
+              stderr: "Usage: bb command-center ack <id> --task-key ABC-12",
             };
           }
           if (!ackRequest(id, taskKey)) {
@@ -4090,7 +5061,7 @@ export default async function plugin(bb: BbPluginApi) {
         case "ready": {
           const id = parsed.positional[0];
           if (id === undefined) {
-            return { exitCode: 1, stderr: "Usage: bb inbox ready <id>" };
+            return { exitCode: 1, stderr: "Usage: bb command-center ready <id>" };
           }
           const result = await moveCard(id, "in_review");
           if (!result.ok) {
@@ -4115,7 +5086,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (id === undefined) {
             return {
               exitCode: 1,
-              stderr: 'Usage: bb inbox close <id> [--outcome "…"] [--cancelled]',
+              stderr: 'Usage: bb command-center close <id> [--outcome "…"] [--cancelled]',
             };
           }
           const cancelled = has(parsed, "cancelled");
@@ -4131,7 +5102,7 @@ export default async function plugin(bb: BbPluginApi) {
         case "dispatch": {
           const id = parsed.positional[0];
           if (id === undefined) {
-            return { exitCode: 1, stderr: "Usage: bb inbox dispatch <id>" };
+            return { exitCode: 1, stderr: "Usage: bb command-center dispatch <id>" };
           }
           const result = await dispatchRequest(id);
           if (!result.ok) {
@@ -4173,7 +5144,7 @@ export default async function plugin(bb: BbPluginApi) {
           if (transcript === "") {
             return {
               exitCode: 1,
-              stderr: 'Usage: bb inbox voice-parse "<spoken phrase>"',
+              stderr: 'Usage: bb command-center voice-parse "<spoken phrase>"',
             };
           }
           const result = parseVoiceCommand(transcript, await voiceProjects());
@@ -4193,10 +5164,335 @@ export default async function plugin(bb: BbPluginApi) {
           };
         }
 
+        case "chief": {
+          const sub = parsed.positional[0] ?? "status";
+          const subPositional = parsed.positional.slice(1);
+          const ok = (text: string, data: unknown) => ({
+            exitCode: 0,
+            stdout: json ? `${JSON.stringify(data, null, 2)}\n` : text,
+          });
+          const fail = (message: string) => ({
+            exitCode: 1,
+            stderr: `${message}\n`,
+          });
+
+          switch (sub) {
+            case "status": {
+              const { chief, groups, projects } = await roster();
+              const inbox = chiefNeedsInput();
+              const scope = first(parsed, "project");
+              const shown = scope
+                ? groups.filter((group) => group.projectId === scope)
+                : groups;
+              const lines = [
+                `Chief: ${chief ? `${chief.threadId} [${chief.status}]` : "not started (bb command-center chief start)"}`,
+              ];
+              if (shown.length === 0) lines.push("Project chiefs: none");
+              for (const group of shown) {
+                lines.push(
+                  `${group.projectName}  ${group.chief.threadId} [${group.chief.status}]`,
+                );
+                for (const architect of group.architects) {
+                  lines.push(
+                    `    ${architect.taskKey ?? "(no task)"}  ${architect.title}  [${
+                      architect.status
+                    }${architect.retired ? ", retired" : ""}]  ${architect.threadId}`,
+                  );
+                }
+              }
+              lines.push(
+                inbox.items.length === 0
+                  ? "Waiting on the Captain: nothing"
+                  : `Waiting on the Captain: ${inbox.items.length}`,
+              );
+              for (const item of inbox.items) {
+                lines.push(`  ${item.id}  ${item.question}`);
+              }
+              return ok(`${lines.join("\n")}\n`, {
+                chief,
+                groups: shown,
+                projects,
+                needsInput: inbox.items,
+              });
+            }
+
+            case "start": {
+              const result = await ensureChief();
+              return ok(
+                `${result.created ? "Started Chief:" : "Chief already running:"} ${result.threadId}\n`,
+                result,
+              );
+            }
+
+            case "adopt": {
+              const threadId = first(parsed, "thread") ?? subPositional[0];
+              if (!threadId) return fail("adopt needs --thread <thread-id>");
+              const thread = await bb.sdk.threads.get({ threadId });
+              recordChief(threadId, thread.projectId);
+              return ok(`Chief is now ${threadId}.\n`, { threadId });
+            }
+
+            case "project-chief": {
+              const projectId = first(parsed, "project") ?? ctx.projectId;
+              const charter = first(parsed, "charter");
+              if (!projectId) return fail("needs --project <proj-id>");
+              if (!charter) return fail('needs --charter "<what this chief owns>"');
+              const result = await ensureProjectChief({ projectId, charter });
+              return ok(
+                `${result.created ? "Started" : "Already running:"} project chief ${result.threadId} for ${projectId}\n`,
+                result,
+              );
+            }
+
+            case "adopt-project-chief": {
+              const threadId = first(parsed, "thread") ?? subPositional[0];
+              if (!threadId) {
+                return fail("adopt-project-chief needs --thread <thread-id>");
+              }
+              let thread;
+              try {
+                thread = await bb.sdk.threads.get({ threadId });
+              } catch {
+                return fail(`no such thread ${threadId}`);
+              }
+              const projectId = thread.projectId;
+              if (!projectId) {
+                return fail(`thread ${threadId} belongs to no project`);
+              }
+              const asked = first(parsed, "project");
+              if (asked && asked !== projectId) {
+                return fail(
+                  `thread ${threadId} lives in ${projectId}, not ${asked} — a chief owns the project its thread is in`,
+                );
+              }
+              const current = projectChiefRow(projectId);
+              if (
+                current &&
+                current.thread_id !== threadId &&
+                (await statusOf(current.thread_id)) &&
+                !has(parsed, "force")
+              ) {
+                return fail(
+                  `${projectId} already has a live project chief ${current.thread_id}. Re-run with --force to point the registry at ${threadId} instead.`,
+                );
+              }
+              const charter =
+                first(parsed, "charter") ??
+                current?.charter ??
+                `Adopted existing project chief thread ${threadId}.`;
+              recordProjectChief(projectId, threadId, charter);
+              bb.log.info(`project chief ${threadId} adopted for ${projectId}`);
+              return ok(
+                `Project chief for ${projectId} is now ${threadId}.\n`,
+                { threadId, projectId, charter, created: false },
+              );
+            }
+
+            case "handoff": {
+              const taskKey = first(parsed, "task");
+              const title = first(parsed, "title");
+              const mission = first(parsed, "mission");
+              if (!taskKey || !title || !mission) {
+                return fail(
+                  'handoff needs --task <key>, --title "<short title>" and --mission "<the brief>"',
+                );
+              }
+              const workspace = first(parsed, "workspace");
+              if (
+                workspace &&
+                workspace !== "worktree" &&
+                workspace !== "project-default"
+              ) {
+                return fail("--workspace must be worktree or project-default");
+              }
+              const result = await handoff(
+                {
+                  taskKey,
+                  title,
+                  mission,
+                  successCriteria: parsed.flags["criteria"] ?? [],
+                  constraints: parsed.flags["constraint"] ?? [],
+                  context: first(parsed, "context"),
+                  projectId: first(parsed, "project"),
+                  environment: workspace as
+                    | "worktree"
+                    | "project-default"
+                    | undefined,
+                  workflowName: first(parsed, "workflow"),
+                },
+                ctx.threadId ?? null,
+              );
+              return ok(
+                `Handed ${taskKey} to ${result.threadId}.\n` +
+                  `Attach it: bb tasks attach ${taskKey} --thread ${result.threadId}\n`,
+                { taskKey, ...result },
+              );
+            }
+
+            case "workflow": {
+              const [wsub, wname] = subPositional;
+              switch (wsub) {
+                case "create": {
+                  const workflowName = first(parsed, "name");
+                  const stepsJson = first(parsed, "steps-json");
+                  if (!workflowName || !stepsJson) {
+                    return fail(
+                      'workflow create needs --name "<name>" --steps-json \'[{"name":"…","instructions":"…"}]\'',
+                    );
+                  }
+                  try {
+                    const steps = parseWorkflowSteps(stepsJson);
+                    const workflow = createChiefWorkflow(workflowName, steps);
+                    return ok(
+                      `Created "${workflowName}" (${steps.length} step${steps.length === 1 ? "" : "s"}).\n`,
+                      workflow,
+                    );
+                  } catch (error) {
+                    return fail(String(error));
+                  }
+                }
+                case "list": {
+                  const workflows = listChiefWorkflows();
+                  return ok(
+                    workflows.length === 0
+                      ? "No workflows defined.\n"
+                      : workflows
+                          .map((w) => `${w.name}  (${w.stepCount} step${w.stepCount === 1 ? "" : "s"})`)
+                          .join("\n") + "\n",
+                    { workflows },
+                  );
+                }
+                case "get": {
+                  if (!wname) return fail("workflow get needs a name");
+                  const workflow = getWorkflowByName(wname);
+                  if (!workflow) return fail(`no workflow named "${wname}"`);
+                  return ok(`${JSON.stringify(workflow, null, 2)}\n`, workflow);
+                }
+                case "update": {
+                  if (!wname) return fail("workflow update needs a name");
+                  const stepsJson = first(parsed, "steps-json");
+                  if (!stepsJson) return fail("workflow update needs --steps-json '[...]'");
+                  try {
+                    const steps = parseWorkflowSteps(stepsJson);
+                    const workflow = updateChiefWorkflowSteps(wname, steps);
+                    return ok(
+                      `Updated "${wname}" (${steps.length} step${steps.length === 1 ? "" : "s"}).\n`,
+                      workflow,
+                    );
+                  } catch (error) {
+                    return fail(String(error));
+                  }
+                }
+                case "delete": {
+                  if (!wname) return fail("workflow delete needs a name");
+                  const removed = deleteChiefWorkflow(wname);
+                  if (!removed) return fail(`no workflow named "${wname}"`);
+                  return ok(`Deleted "${wname}".\n`, { name: wname });
+                }
+                default:
+                  return fail(
+                    "usage: bb command-center chief workflow <create|list|get|update|delete> ...",
+                  );
+              }
+            }
+
+            case "retire": {
+              const threadId = subPositional[0];
+              if (!threadId) return fail("retire needs a thread id");
+              const value = has(parsed, "undo") ? 0 : 1;
+              const changed =
+                db
+                  .prepare(`UPDATE architects SET retired = ? WHERE thread_id = ?`)
+                  .run(value, threadId).changes +
+                db
+                  .prepare(
+                    `UPDATE project_chiefs SET retired = ? WHERE thread_id = ?`,
+                  )
+                  .run(value, threadId).changes;
+              reloadRoles();
+              publish();
+              if (changed === 0) return fail(`no registered thread ${threadId}`);
+              return ok(
+                `${value === 1 ? "Retired" : "Restored"} ${threadId}.\n`,
+                { threadId, retired: value === 1 },
+              );
+            }
+
+            case "tidy": {
+              const visibility = has(parsed, "undo") ? "visible" : "hidden";
+              const parent = first(parsed, "parent");
+              const recursive = has(parsed, "recursive");
+
+              const descendants = async (rootId: string) => {
+                const found: string[] = [];
+                const queue = [rootId];
+                const seen = new Set<string>([rootId]);
+                while (queue.length > 0) {
+                  const current = queue.shift()!;
+                  const threads = await bb.sdk.threads.list({
+                    parentThreadId: current,
+                    includeHidden: true,
+                    limit: 200,
+                  });
+                  for (const child of threads) {
+                    if (seen.has(child.id)) continue;
+                    seen.add(child.id);
+                    found.push(child.id);
+                    if (recursive) queue.push(child.id);
+                  }
+                }
+                return found;
+              };
+
+              const targets = parent
+                ? await descendants(parent)
+                : [
+                    ...(chiefThreadId ? [chiefThreadId] : []),
+                    ...(
+                      db
+                        .prepare(`SELECT thread_id FROM project_chiefs`)
+                        .all() as { thread_id: string }[]
+                    ).map((row) => row.thread_id),
+                    ...(
+                      db.prepare(`SELECT thread_id FROM architects`).all() as {
+                        thread_id: string;
+                      }[]
+                    ).map((row) => row.thread_id),
+                  ];
+
+              const changed: string[] = [];
+              const failed: { threadId: string; error: string }[] = [];
+              for (const threadId of targets) {
+                try {
+                  await bb.sdk.threads.update({ threadId, visibility });
+                  changed.push(threadId);
+                } catch (error) {
+                  failed.push({ threadId, error: String(error) });
+                }
+              }
+              publish();
+              const undoParent = parent ? ` --parent ${parent}` : "";
+              return ok(
+                targets.length === 0
+                  ? "Nothing to tidy.\n"
+                  : `${visibility === "hidden" ? "Hid" : "Restored"} ${changed.length} of ${targets.length} thread(s).` +
+                      (failed.length > 0 ? ` ${failed.length} failed.` : "") +
+                      `\nUndo: bb command-center chief tidy${undoParent}${recursive ? " --recursive" : ""} --undo\n`,
+                { visibility, changed, failed },
+              );
+            }
+
+            default:
+              return fail(
+                `unknown chief command "${sub}". Try: status, start, adopt, project-chief, adopt-project-chief, handoff, workflow, retire, tidy`,
+              );
+          }
+        }
+
         default:
           return {
             exitCode: 1,
-            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, notify-test`,
+            stderr: `unknown command "${command ?? ""}". Try: ask, review, list, get, wait, done, answers, snooze, add, queue, ack, ready, close, dispatch, voice-parse, chief, notify-test`,
           };
       }
     },

@@ -5,7 +5,7 @@ description: Ask the user for any input asynchronously instead of stalling — a
 
 # User inbox
 
-`bb inbox` is the user's single portal for everything agents need from them. It
+`bb command-center` is the user's single portal for everything agents need from them. It
 is designed for many agents asking at once while the user multitasks, so:
 
 - **Always pass `--asked-by`** with a short label for who is blocked (e.g.
@@ -22,20 +22,20 @@ Pick the shape that fits what you need:
 
 ```sh
 # One choice — the best default. Options become buttons.
-bb inbox ask --task "Release 2.4" --question "Ship now or wait for CI?" \
+bb command-center ask --task "Release 2.4" --question "Ship now or wait for CI?" \
   --option "Ship now" --option "Wait for CI" --asked-by "worker: release"
 
 # Several choices — checkboxes; the answer comes back comma-separated.
-bb inbox ask --task "Sprint scope" --question "Which should land this week?" \
+bb command-center ask --task "Sprint scope" --question "Which should land this week?" \
   --multi --option Snooze --option "Group by task" --option "Slack mirror" \
   --asked-by "chief"
 
 # A value you cannot guess.
-bb inbox ask --task "Staging deploy" --question "Which subdomain?" \
+bb command-center ask --task "Staging deploy" --question "Which subdomain?" \
   --input --placeholder "e.g. staging-2" --asked-by "worker: deploy"
 
 # An FYI that only needs acknowledging (no options, no --input).
-bb inbox ask --task "Migration" --question "Heads up: I skipped the legacy table."
+bb command-center ask --task "Migration" --question "Heads up: I skipped the legacy table."
 ```
 
 ## Ask for a review
@@ -45,14 +45,14 @@ send a review request. The card gets an Open-thread button, your optional verdic
 buttons, and a notes box:
 
 ```sh
-bb inbox review --task "MCP-1443" \
+bb command-center review --task "MCP-1443" \
   --question "Review the cloudId fallback approach before I open the PR." \
   --thread thr_jrs8jjht6k \
   --option Approve --option "Needs changes" \
   --asked-by "worker: MCP-1443"
 
 # Or point at anything with a URL instead:
-bb inbox review --task "ENG-42" --question "Skim the PR description?" \
+bb command-center review --task "ENG-42" --question "Skim the PR description?" \
   --url https://github.com/acme/app/pull/42
 ```
 
@@ -73,15 +73,15 @@ reaches you and you continue**. Pick how it reaches you:
 
 ```sh
 # Stay on the line: blocks, returns the answer, you continue in the same turn.
-bb inbox ask --task "…" --question "…" --option A --option B --wait --timeout-sec 600
+bb command-center ask --task "…" --question "…" --option A --option B --wait --timeout-sec 600
 
 # Or ask and end the turn: the answer is delivered into this thread as a
 # message when the user resolves it, which wakes you up to continue.
-bb inbox ask --task "…" --question "…" --input
+bb command-center ask --task "…" --question "…" --input
 
 # Or check on your own schedule.
-bb inbox get <id> --json
-bb inbox wait <id> --timeout-sec 600 --json
+bb command-center get <id> --json
+bb command-center wait <id> --timeout-sec 600 --json
 ```
 
 `--wait` is right when the work cannot proceed without the answer and the user
@@ -93,20 +93,20 @@ If you are a **replacement thread** and an answer was delivered to a thread that
 no longer exists, catch up with:
 
 ```sh
-bb inbox answers --since-min 120 --json
+bb command-center answers --since-min 120 --json
 ```
 
-Housekeeping: `bb inbox list [--all]` shows the queue; `bb inbox done <id>`
+Housekeeping: `bb command-center list [--all]` shows the queue; `bb command-center done <id>`
 withdraws a question you no longer need answered.
 
 The user can snooze an item, which keeps it open and unanswered but drops it out
 of the queue until it comes due — so **an item you are waiting on may go quiet
-for a while**. Do not re-ask; `bb inbox get <id>` still reports it, and the
+for a while**. Do not re-ask; `bb command-center get <id>` still reports it, and the
 answer is delivered whenever they get to it. You can snooze on their behalf when
 you know something is not actionable yet:
 
 ```sh
-bb inbox snooze <id> --hours 4     # also --minutes N, or --clear to wake it
+bb command-center snooze <id> --hours 4     # also --minutes N, or --clear to wake it
 ```
 
 ## Retractions
@@ -136,7 +136,7 @@ keep the Captain's picture accurate — with two extra obligations:
    un-started and the Captain can follow it to the board:
 
    ```sh
-   bb inbox ack cc_a1b2c3 --task-key ABC-12
+   bb command-center ack cc_a1b2c3 --task-key ABC-12
    ```
 
 2. **Park it for sign-off** when the work is done but a human should look — a PR
@@ -144,7 +144,7 @@ keep the Captain's picture accurate — with two extra obligations:
    yourself. The card moves to the board's **In review** lane and waits there:
 
    ```sh
-   bb inbox ready cc_a1b2c3 --outcome "PR #412 is open"
+   bb command-center ready cc_a1b2c3 --outcome "PR #412 is open"
    ```
 
    Setting the task's own status does the same thing, so
@@ -155,8 +155,8 @@ keep the Captain's picture accurate — with two extra obligations:
    reviewable artefact, or that was abandoned.
 
    ```sh
-   bb inbox close cc_a1b2c3 --outcome "Shipped in PR #412"
-   bb inbox close cc_a1b2c3 --cancelled --outcome "Superseded by ABC-19"
+   bb command-center close cc_a1b2c3 --outcome "Shipped in PR #412"
+   bb command-center close cc_a1b2c3 --cancelled --outcome "Superseded by ABC-19"
    ```
 
    **Prefer `ready` over `close` for anything reviewable.** Moving a card into
@@ -172,14 +172,14 @@ the card again.
 **Done → In review.** The moment the work is finished, park it:
 
 ```sh
-bb inbox ready cc_a1b2c3 --outcome "PR #412 is open"
+bb command-center ready cc_a1b2c3 --outcome "PR #412 is open"
 ```
 
 **Stuck → Needs you.** The moment you cannot proceed — a decision, a missing
 credential, an approval, an ambiguity — file it as a question:
 
 ```sh
-bb inbox ask --task "<key>" --question "…" --option "…" --option "…" \
+bb command-center ask --task "<key>" --question "…" --option "…" --option "…" \
   --asked-by "worker: <key>"
 ```
 
@@ -192,15 +192,15 @@ and moved into Needs you by the plugin itself, so going quiet does not hide work
 — it just makes the report worse than if you had asked.
 
 Never silently drop a request: if it is not actionable, ask about it through
-`bb inbox ask` rather than leaving the card sitting in flight.
+`bb command-center ask` rather than leaving the card sitting in flight.
 
 Reading and adding requests (any agent may do this — useful for capturing
 follow-ups the Captain should decide on later):
 
 ```sh
-bb inbox queue --json                 # the request lane, in order
-bb inbox add "Bump the MCP SDK" --body "Blocked on the 2.1 release" --priority low
+bb command-center queue --json                 # the request lane, in order
+bb command-center add "Bump the MCP SDK" --body "Blocked on the 2.1 release" --priority low
 ```
 
-`bb inbox add` only **queues** — dispatch is the Captain's click. Do not
+`bb command-center add` only **queues** — dispatch is the Captain's click. Do not
 dispatch on their behalf.

@@ -3,21 +3,21 @@
 ![Board](docs/screenshots/board.png)
 
 The Captain's command center: a board of everything in flight and the
-questions waiting on you. It dispatches work to Chief but does not own it —
-Chief is the separate `chief-nav` plugin, talked to only over cross-plugin rpc.
-(The two lived merged into one plugin for a while; they were split back apart.)
+questions waiting on you. It dispatches work to Chief — the org of one global
+Chief, a project chief per project, and task architects beneath them — which
+lives in this same plugin, so there is nothing else to install.
 
 The board runs Queue → In progress → In review → Done, with a derived Needs you
 lane. Moving a card into **Done is deliberately manual** — signing work off is
 the Captain's call, so agents park finished work in In review with
-`bb inbox ready <id>` (or by setting the task to `in_review`) and stop there.
-A review request (`bb inbox review …`) lands in In review too, since "look at
+`bb command-center ready <id>` (or by setting the task to `in_review`) and stop there.
+A review request (`bb command-center review …`) lands in In review too, since "look at
 this PR" and "read this doc" are sign-off, not a decision blocking an agent.
 
 Two lanes run in opposite directions through the board:
 
 - **Needs you** — questions, review requests and FYIs that agents raised with
-  `bb inbox ask` / `bb inbox review`. Answers are delivered back into the asking
+  `bb command-center ask` / `bb command-center review`. Answers are delivered back into the asking
   thread durably, and an answer you take back reaches the agent as an explicit
   `CORRECTION`.
 - **Queue** — work *you* write down, dispatched to Chief when you say so. Chief
@@ -46,11 +46,11 @@ harness.
 The choice is honoured in two places, deliberately belt-and-braces:
 
 1. The dispatch brief tells Chief which harness and model the Captain picked.
-2. `chief_handoff` (in chief-nav) takes optional `providerId`/`model`, and
-   **when they are omitted it falls back to the card's choice, then the
-   remembered default** — read from this plugin's `dispatchPreference` rpc — so
-   the pick survives Chief forgetting to pass it on. The tool reports what it
-   actually spawned on.
+2. `chief_handoff` takes optional `providerId`/`model`, and **when they are
+   omitted it falls back to the card's choice, then the remembered
+   default** — read internally via `dispatchPreferenceFor` — so the pick
+   survives Chief forgetting to pass it on. The tool reports what it actually
+   spawned on.
 
 Discovery comes from `providers.list()` plus `providers.models({ providerId })`
 per provider, cached for a minute because each is a host round trip.
@@ -96,7 +96,7 @@ Two things it will not do, on purpose:
 
 - **Never** archive Chief's own thread or a project chief's thread, even if one
   somehow ended up attached to a card — those are the org's standing
-  leadership, never a per-task worker, checked against chief-nav's roster
+  leadership, never a per-task worker, checked against Chief's own roster
   before anything is touched.
 - If a thread fails to archive (already gone, unreachable), the card still
   archives — you get a toast naming the ones that did not, rather than the
@@ -151,7 +151,7 @@ macOS banners when something needs you or a card moves. bb has no native OS
 notifications, so this plugin sends them itself.
 
 ```
-bb inbox notify-test                                   # check the OS lets them through
+bb command-center notify-test                                   # check the OS lets them through
 bb plugin config command-center set notify off         # off | important | all
 bb plugin config command-center set notifySound true
 ```
@@ -212,7 +212,7 @@ if nothing clearly wins, it asks you to pick.
 Check the grammar without a microphone:
 
 ```
-bb inbox voice-parse "bump the SDK, high priority, dispatch"
+bb command-center voice-parse "bump the SDK, high priority, dispatch"
 ```
 
 Voice needs transcription configured on the server
@@ -222,60 +222,48 @@ why when it is not.
 ## CLI
 
 ```
-bb inbox ask --task "Release 2.4" --question "Ship now or wait?" \
+bb command-center ask --task "Release 2.4" --question "Ship now or wait?" \
   --option "Ship now" --option "Wait" --asked-by "worker: release"
-bb inbox review --task "ENG-42" --question "Skim the approach?" --thread thr_x
-bb inbox list [--all]            # the question queue
-bb inbox wait <id>               # block until answered
-bb inbox snooze <id> --hours 4
+bb command-center review --task "ENG-42" --question "Skim the approach?" --thread thr_x
+bb command-center list [--all]            # the question queue
+bb command-center wait <id>               # block until answered
+bb command-center snooze <id> --hours 4
 
-bb inbox add "<title>" [--body … --project … --priority … --urgent]
-bb inbox queue [--all]           # the request lane
-bb inbox ack <id> --task-key ABC-12
-bb inbox close <id> --outcome "Shipped in PR #412"
+bb command-center add "<title>" [--body … --project … --priority … --urgent]
+bb command-center queue [--all]           # the request lane
+bb command-center ack <id> --task-key ABC-12
+bb command-center close <id> --outcome "Shipped in PR #412"
 ```
 
 Agents get the same surface through the bundled `user-inbox` skill.
 
 ## Chief, and working without it
 
-Chief is the separate `chief-nav` plugin — its own panel, its own `bb chief`
-command, its own agent tools (`chief_project_chief`, `chief_handoff`,
-`chief_roster`) and its own database. This plugin never imports it; the two
-talk only over `bb.sdk.plugins.callRpc`:
+Chief — one global Chief, a project chief per project, task architects
+beneath them — is native to this plugin: its own nav panel, `bb command-center
+chief` subcommands, agent tools (`chief_project_chief`, `chief_handoff`,
+`chief_roster`), and its own tables in this plugin's database. There is no
+separate plugin and no cross-plugin rpc involved.
 
-- Dispatching a request asks chief-nav's `state` rpc for the live Chief thread.
-- chief-nav's needs-input rail reads this plugin's `list` rpc.
-- chief-nav reads this plugin's `dispatchPreference` rpc to honour the
-  harness/model chosen in the composer when handing work to an architect.
-
-Chief is preferred whenever it is reachable, but never required. Without it,
-**Dispatch** and **Wake up in a new thread** spawn the worker directly
-(`bb.sdk.threads.spawn`, the same primitive chief-nav itself uses) with a
-self-contained brief: create and attach its own task, ack the request back,
-escalate through the Inbox, close it when done. `directWorktree` (on by
-default) controls whether that direct spawn gets its own worktree.
-
-(The two lived merged into one plugin for a while, sharing a database and CLI
-command; they were split back into separate plugins, restoring the original
-cross-plugin contract above.)
+Chief is preferred whenever it has been started, but never required. Before
+it has, or if you never start it, **Dispatch** and **Wake up in a new thread**
+spawn the worker directly (`bb.sdk.threads.spawn`) with a self-contained
+brief: create and attach its own task, ack the request back, escalate through
+the Inbox, close it when done. `directWorktree` (on by default) controls
+whether that direct spawn gets its own worktree.
 
 ## Companion plugins
 
-This plugin needs two things it does not bundle, and there is no plugin
-manifest field to declare either as a dependency — so a fresh install of just
-this plugin would otherwise leave both silently missing:
+This plugin needs one thing it does not bundle, and there is no plugin
+manifest field to declare it as a dependency — so a fresh install of just this
+plugin would otherwise leave it silently missing:
 
 - **BB's own Tasks plugin** — task keys, comments, board status. Nearly
   everything task-related goes through it.
-- **chief-nav** — optional (see above), but installed by default for the full
-  experience.
 
-An `ensure-companions` background service checks for both on load and installs
-whichever is missing (`builtin:tasks`, and chief-nav from its published
-repository) — no prompt, since Tasks ships with `bb` itself and chief-nav is
-this same author's companion plugin. If you deliberately do not want Chief,
-removing it after install is fine; dispatch keeps working either way.
+An `ensure-companions` background service checks for it on load and installs
+it (`builtin:tasks`) if missing — no prompt, since Tasks ships with `bb`
+itself.
 
 ## Data
 
@@ -284,20 +272,25 @@ removing it after install is fine; dispatch keeps working either way.
 > `~/.bb/plugins/command-center/data.db`. Delete the old directory once you are
 > confident nothing is missing.
 
-`items` (questions) and `requests` (the command center lane) live in one
-SQLite at `<dataDir>/plugins/command-center/data.db`. Migrations 0–11
-reconstruct the `items` schema exactly as it shipped originally — **append new
-migrations only at the end, never edit or reorder a shipped one.** Chief's own
-tables live in chief-nav's separate database.
+`items` (questions), `requests` (the command center lane), and Chief's own
+tables (`chief`, `project_chiefs`, `architects`, `workflows`, `workflow_steps`)
+all live in one SQLite at `<dataDir>/plugins/command-center/data.db`.
+Migrations 0–11 reconstruct the `items` schema exactly as it shipped
+originally — **append new migrations only at the end, never edit or reorder a
+shipped one.**
 
 ## Layout
 
-- `server.ts` / `app.tsx` — the command center: board, queue, questions, voice.
+- `server.ts` / `app.tsx` — the command center board, queue, questions, voice,
+  and Chief (the org tree, workflows, agent tools, CLI, and nav panel).
 - `lib/`, `hooks/` — pure logic (voice grammar, shortcut parsing, artifact
   extraction, stall detection) and React hooks, both unit-testable without a
   server.
 - `card-parts.tsx` — the answering block (with voice, snooze, dismiss) shared
   by the board and the reading view.
+- `skills/` — `user-inbox` (answering from an agent's own thread) plus
+  `chief`, `project-chief`, and `chief-architect` (the Chief org's chain of
+  command).
 
 ## Tasks
 
