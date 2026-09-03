@@ -17,9 +17,10 @@ this PR" and "read this doc" are sign-off, not a decision blocking an agent.
 Two lanes run in opposite directions through the board:
 
 - **Needs you** — questions, review requests and FYIs that agents raised with
-  `bb command-center ask` / `bb command-center review`. Answers are delivered back into the asking
-  thread durably, and an answer you take back reaches the agent as an explicit
-  `CORRECTION`.
+  `bb command-center ask` / `bb command-center review`. These are lightweight
+  notifications, not a form: there's nothing to pick or type on the card
+  itself — open the thread and reply there, same as any other conversation,
+  then dismiss the card once it's handled.
 - **Queue** — work *you* write down, dispatched to Chief when you say so. Chief
   routes it to the owning project chief, which creates the task and hands it to
   an architect. Requests are never dispatched automatically.
@@ -70,8 +71,9 @@ everything else is mined out of the prose the card already carries, because
 that is where agents actually leave links. Confluence links are named by their
 page title, draft state or space rather than all reading "Confluence page".
 
-The board's own click-through still opens the quick dialog for answering and
-commenting; the title opens the reading view.
+A question card's own buttons (open the thread or link, dismiss, snooze) work
+straight from the board tile; the title opens the reading view for everything
+else.
 
 ## Archiving
 
@@ -178,8 +180,8 @@ appears, allow it under System Settings → Notifications.
 
 ## Voice
 
-Speak instead of typing. `⌥V` toggles the mic anywhere in the panel, or click
-the mic on the composer or on any question card.
+Speak instead of typing when composing a request. `⌥V` toggles the mic
+anywhere in the panel, or click the mic on the composer.
 
 Voice always fills the form and stops — it never queues, dispatches or answers
 on its own, because acting on a mishearing is worse than one extra tap.
@@ -204,12 +206,11 @@ Because an unpunctuated split is ambiguous, it only happens when what follows is
 a clause of its own (four words or more) and the marker is not part of a noun
 phrase, so "update the notes page for the new API" stays one title.
 
-On a question card the mic dictates a text answer, or matches what you said
-against the offered options — including `yep`/`nope` for yes/no, and several
-options at once on a multi-select. The match is preselected for you to confirm;
-if nothing clearly wins, it asks you to pick.
+Question cards have no mic of their own — there's nothing to dictate an
+answer into. Reply in the thread's chat instead, by voice or otherwise,
+however you'd normally talk to that agent.
 
-Check the grammar without a microphone:
+Check the request-composing grammar without a microphone:
 
 ```
 bb command-center voice-parse "bump the SDK, high priority, dispatch"
@@ -223,10 +224,10 @@ why when it is not.
 
 ```
 bb command-center ask --task "Release 2.4" --question "Ship now or wait?" \
-  --option "Ship now" --option "Wait" --asked-by "worker: release"
+  --asked-by "worker: release"
 bb command-center review --task "ENG-42" --question "Skim the approach?" --thread thr_x
 bb command-center list [--all]            # the question queue
-bb command-center wait <id>               # block until answered
+bb command-center wait <id>               # block until the item is dismissed
 bb command-center snooze <id> --hours 4
 
 bb command-center add "<title>" [--body … --project … --priority … --urgent]
@@ -245,12 +246,22 @@ chief` subcommands, agent tools (`chief_project_chief`, `chief_handoff`,
 `chief_roster`), and its own tables in this plugin's database. There is no
 separate plugin and no cross-plugin rpc involved.
 
-Chief is preferred whenever it has been started, but never required. Before
-it has, or if you never start it, **Dispatch** and **Wake up in a new thread**
-spawn the worker directly (`bb.sdk.threads.spawn`) with a self-contained
-brief: create and attach its own task, ack the request back, escalate through
-the Inbox, close it when done. `directWorktree` (on by default) controls
-whether that direct spawn gets its own worktree.
+**Chief's hierarchy is opt-in per project, not a default.** A project only
+routes through Chief once you've stood up a project chief for it
+(`chief_project_chief`, or `bb command-center chief project-chief`) — that's
+a deliberate choice for a project with real ongoing, multi-task work. Every
+other project, including one Chief has never seen, dispatches straight to a
+single worker thread: one hop, one thread, no project-chief/architect
+ceremony for what might be a one-line fix or a quick review. `directWorktree`
+(on by default) controls whether that direct spawn gets its own worktree.
+
+This keeps the common case lean — one agent does the task in one pass and
+parks it in review — while staying as elaborate as you want: name a workflow
+on the request for a multi-step protocol (e.g. implement, then a second
+harness reviews), or just leave a card comment mid-flight asking the worker
+for another pass (a second opinion, an extra reviewer) — the worker's brief
+tells it to treat that as a normal ask, spawning a one-off delegate thread
+for it rather than needing a pre-planned workflow.
 
 ## Companion plugins
 
@@ -286,11 +297,11 @@ shipped one.**
 - `lib/`, `hooks/` — pure logic (voice grammar, shortcut parsing, artifact
   extraction, stall detection) and React hooks, both unit-testable without a
   server.
-- `card-parts.tsx` — the answering block (with voice, snooze, dismiss) shared
-  by the board and the reading view.
-- `skills/` — `user-inbox` (answering from an agent's own thread) plus
-  `chief`, `project-chief`, and `chief-architect` (the Chief org's chain of
-  command).
+- `card-parts.tsx` — the notification card (open thread/link, snooze, dismiss)
+  shared by the board and the reading view.
+- `skills/` — `user-inbox` (notifying the Captain from an agent's own thread)
+  plus `chief`, `project-chief`, and `chief-architect` (the Chief org's chain
+  of command).
 
 ## Tasks
 

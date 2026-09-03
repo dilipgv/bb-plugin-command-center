@@ -46,10 +46,10 @@ the source of truth for the work. This conversation's history is neither.
 
 ## Questions and reviews
 
-- Anything you need from the Captain goes through the Inbox, with a
-  recommendation and 2–3 concrete choices:
-  `bb command-center ask --task "<what this is about>" --question "…" --option "…"
-  --option "…" --asked-by "Chief"`.
+- Anything you need from the Captain goes through the Inbox, stated plainly —
+  it's a notification, not a form. Give a recommendation in the question
+  itself; the Captain replies in this thread's chat, not by picking an option:
+  `bb command-center ask --task "<what this is about>" --question "…" --asked-by "Chief"`.
 - When the Captain should look at a thread below you, point at it — never paste
   the transcript:
   `bb command-center review --task "…" --question "…" --thread <thread-id>

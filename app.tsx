@@ -21,7 +21,7 @@ import {
   useRealtimeConnectionState,
   useRpc,
   useSettings,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -99,11 +99,13 @@ function useCommandCenter(rpc: Rpc) {
     chiefThreadId: string | null;
     chiefError: string | null;
     tasksError: string | null;
+    tasksMissing: boolean;
   }>({
     cards: [],
     chiefThreadId: null,
     chiefError: null,
     tasksError: null,
+    tasksMissing: false,
   });
   const [isLoading, setLoading] = React.useState(true);
 
@@ -556,35 +558,18 @@ function workerTone(liveStatus: string | null): string {
   }
 }
 
-/** Longest option label a lane-width button can show without truncating. */
-const QUICK_ANSWER_MAX_LABEL = 24;
-
 function BoardCardTile({
   card,
-  rpc,
   onRead,
   onArchive,
   onDragStart,
 }: {
   card: BoardCard;
-  rpc: Rpc;
   onRead: (card: BoardCard) => void;
   onArchive: (card: BoardCard) => void;
   onDragStart: (card: BoardCard) => void;
 }) {
   const question = card.question;
-  const canQuickAnswer =
-    question !== null &&
-    question.options.length > 0 &&
-    question.options.every(
-      (option) => option.length <= QUICK_ANSWER_MAX_LABEL,
-    );
-  // This tile and the reader's own answer buttons are two separate mounted
-  // components for the same question — each needs its own guard, or a click
-  // here plus one in the reader (or two quick clicks before this tile
-  // disappears) fire two "answer" calls that the server used to both accept,
-  // each re-sending the whole question into the asker's thread.
-  const [answering, setAnswering] = React.useState(false);
   return (
     <article
       draggable={card.movable}
@@ -663,48 +648,9 @@ function BoardCardTile({
           <p className="line-clamp-4 text-xs text-muted-foreground">
             {question.question}
           </p>
-          <div className="flex flex-wrap gap-1">
-            {canQuickAnswer
-              ? question.options.slice(0, 3).map((option) => (
-                  <Button
-                    key={option}
-                    size="sm"
-                    variant="outline"
-                    className="max-w-full"
-                    disabled={answering}
-                    onClick={() => {
-                      if (answering) return;
-                      setAnswering(true);
-                      void rpc
-                        .call("answer", { id: question.id, answer: option })
-                        .then((result) => {
-                          if (result.ok) toast.success("Answered");
-                          // ok:false means this question was already resolved
-                          // by another click (this tile, or the reader open at
-                          // the same time) — the realtime refresh will remove
-                          // the card; nothing to report as an error.
-                        })
-                        .catch((error: unknown) => toast.error(String(error)))
-                        .finally(() => setAnswering(false));
-                    }}
-                  >
-                    {option}
-                  </Button>
-                ))
-              : null}
-            <Button
-              size="sm"
-              variant={canQuickAnswer ? "ghost" : "outline"}
-              className="max-w-full"
-              onClick={() => onRead(card)}
-            >
-              {canQuickAnswer && question.options.length > 3
-                ? "More…"
-                : canQuickAnswer
-                  ? "Answer…"
-                  : `Answer — ${question.options.length} options`}
-            </Button>
-          </div>
+          <Button size="sm" variant="outline" className="max-w-full" onClick={() => onRead(card)}>
+            Open
+          </Button>
         </div>
       ) : null}
     </article>
@@ -787,7 +733,6 @@ function BoardColumn({
           <BoardCardTile
             key={card.id}
             card={card}
-            rpc={rpc}
             onRead={onRead}
             onArchive={onArchive}
             onDragStart={onDragStart}
@@ -857,8 +802,8 @@ function CommandCenter({ subPath }: { subPath: string }) {
       .catch((error: unknown) =>
         setVoice({ enabled: false, error: String(error) }),
       );
-    // Empty, not an error toast, when chief-nav is absent — a workflow is an
-    // enhancement Chief applies, never something dispatch requires.
+    // Empty, not an error toast, when none are defined yet — a workflow is
+    // an enhancement Chief applies, never something dispatch requires.
     void rpc
       .call("workflows")
       .then((result) => setWorkflows(result.workflows))
@@ -877,6 +822,7 @@ function CommandCenter({ subPath }: { subPath: string }) {
   const [pendingDispatch, setPendingDispatch] = React.useState<BoardCard | null>(
     null,
   );
+  const [installingTasks, setInstallingTasks] = React.useState(false);
 
   // The reading view owns a route, so a card is deep-linkable and browser back
   // returns to the board.
@@ -956,7 +902,6 @@ function CommandCenter({ subPath }: { subPath: string }) {
       <CardViewer
         cardId={viewing}
         rpc={rpc}
-        voice={voice}
         onBack={() => navigate.toPluginPanel("inbox")}
       />
     );
@@ -983,9 +928,33 @@ function CommandCenter({ subPath }: { subPath: string }) {
           ) : null}
 
           {board.tasksError !== null ? (
-            <p className="rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
-              {board.tasksError}
-            </p>
+            <div className="flex flex-wrap items-center gap-2 rounded-md border border-destructive/40 px-3 py-2 text-xs text-destructive">
+              <p className="flex-1">{board.tasksError}</p>
+              {board.tasksMissing ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={installingTasks}
+                  onClick={() => {
+                    setInstallingTasks(true);
+                    void rpc
+                      .call("installTasksPlugin")
+                      .then((result) => {
+                        if (result.ok) {
+                          toast.success("Installed the Tasks plugin");
+                          void refresh();
+                        } else {
+                          toast.error(result.error ?? "Could not install the Tasks plugin");
+                        }
+                      })
+                      .catch((error: unknown) => toast.error(String(error)))
+                      .finally(() => setInstallingTasks(false));
+                  }}
+                >
+                  {installingTasks ? "Installing…" : "Install Tasks"}
+                </Button>
+              ) : null}
+            </div>
           ) : null}
 
           {!voice.enabled && voice.error !== null ? (
@@ -1657,7 +1626,7 @@ export default definePluginApp((app) => {
   app.slots.navPanel({
     id: "chief",
     title: "Chief",
-    icon: "Crown",
+    icon: "Star",
     path: "chief",
     component: ChiefPanel,
     headerContent: ChiefHeader,

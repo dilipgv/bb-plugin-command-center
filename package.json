@@ -1,14 +1,14 @@
 {
   "name": "bb-plugin-command-center",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "type": "module",
   "engines": {
     "bb": ">=0.37",
-    "bbPluginSdk": "^0.4.1"
+    "bbPluginSdk": ">=0.4.34"
   },
   "bb": {
     "name": "Command Center",
-    "description": "The Captain's single surface: a board of everything in flight and the questions waiting on you. Dispatches to Chief (a separate plugin) but does not own it.",
+    "description": "The Captain's single surface: a board of everything in flight and the questions waiting on you. Dispatches work to Chief — one global Chief, a project chief per project, task architects beneath them — native to this plugin.",
     "branding": {
       "icon": "Mail"
     },
@@ -28,6 +28,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.34",
     "@radix-ui/react-dialog": "^1.1.19",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",

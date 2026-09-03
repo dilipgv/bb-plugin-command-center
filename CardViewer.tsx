@@ -11,17 +11,13 @@
  * works, and on a phone it is a page rather than a cramped drawer.
  */
 import * as React from "react";
-import { Markdown, useBbNavigate, useRpc } from "@bb/plugin-sdk/app";
+import { Markdown, useBbNavigate, useRpc } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Icon, type IconName } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
-import {
-  QuestionCard,
-  toastArchiveResult,
-  type VoiceAvailability,
-} from "./card-parts";
+import { QuestionCard, toastArchiveResult } from "./card-parts";
 import { previewMarkdown } from "./lib/markdown-preview";
 import type { BoardCard, BoardLane, rpcContract } from "./server";
 
@@ -262,12 +258,10 @@ function Section({
 export function CardViewer({
   cardId,
   rpc,
-  voice,
   onBack,
 }: {
   cardId: string;
   rpc: Rpc;
-  voice: VoiceAvailability;
   onBack: () => void;
 }) {
   const navigate = useBbNavigate();
@@ -495,7 +489,6 @@ export function CardViewer({
             <QuestionCard
               item={card.question}
               rpc={rpc}
-              voice={voice}
               onNavigate={(threadId) => navigate.toThread(threadId)}
               onResolved={() => void load()}
             />

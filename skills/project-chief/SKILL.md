@@ -48,10 +48,12 @@ hand off each.
 
 ## Escalating
 
-- Decisions you cannot make go up with a recommendation and 2–3 choices:
-  `bb command-center ask --task "<key>" --task-key "<key>" --question "…" --option "…"
-  --option "…" --asked-by "project chief: <project>"`. Add `--urgent` only when
-  work is genuinely stopped.
+- Decisions you cannot make go up as a plain question with your recommendation
+  stated in it — it's a notification, not a form; the Captain replies in this
+  thread's chat:
+  `bb command-center ask --task "<key>" --task-key "<key>" --question "…"
+  --asked-by "project chief: <project>"`. Add `--urgent` only when work is
+  genuinely stopped.
 - For something the Captain should look at, point at the thread:
   `bb command-center review --task "<key>" --task-key "<key>" --question "…"
   --thread <thread-id>`.

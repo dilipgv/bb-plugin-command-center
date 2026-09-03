@@ -20,7 +20,7 @@ import {
   PLUGIN_CLI_OUTPUT_MAX_BYTES,
   type BbPluginApi,
   type JsonValue,
-} from "@bb/plugin-sdk";
+} from "@get-bb/plugin-sdk";
 import { execFile } from "node:child_process";
 import { z } from "zod";
 
@@ -28,12 +28,7 @@ import { extractArtifacts, type Artifact } from "./lib/artifacts";
 import { previewMarkdown } from "./lib/markdown-preview";
 import { isStalled, lastActivity } from "./lib/stall";
 
-import {
-  matchSpokenOption,
-  matchSpokenOptions,
-  parseVoiceCommand,
-  type VoiceProject,
-} from "./lib/voice-command";
+import { parseVoiceCommand, type VoiceProject } from "./lib/voice-command";
 
 // ---------------------------------------------------------------- shapes
 
@@ -371,7 +366,14 @@ export const rpcContract = defineRpcContract({
       chiefError: z.string().nullable(),
       /** Non-null when the Tasks plugin could not be read. */
       tasksError: z.string().nullable(),
+      /** True when tasksError is specifically "not installed" — offer the button. */
+      tasksMissing: z.boolean(),
     }),
+  },
+  /** Explicit, user-clicked install — never automatic. */
+  installTasksPlugin: {
+    input: z.null(),
+    output: z.object({ ok: z.boolean(), error: z.string().nullable() }),
   },
   moveCard: {
     input: z
@@ -579,18 +581,6 @@ export const rpcContract = defineRpcContract({
       projectName: z.string().nullable(),
       intent: z.enum(["queue", "dispatch"]),
       understood: z.array(z.string()),
-    }),
-  },
-  /** A spoken answer to one open question, matched against its options. */
-  voiceAnswer: {
-    input: voiceClipInput.extend({ itemId: z.string() }).strict(),
-    output: z.object({
-      transcript: z.string(),
-      /** Best single option, when one clearly wins. */
-      option: z.string().nullable(),
-      confidence: z.number(),
-      /** Every option mentioned, for multi-select questions. */
-      options: z.array(z.string()),
     }),
   },
   /** Test phrasing without a microphone. Also powers `bb command-center voice-parse`. */
@@ -1299,11 +1289,21 @@ export default async function plugin(bb: BbPluginApi) {
     } catch {
       throw new Error("--steps-json is not valid JSON");
     }
+    // Both are rendered verbatim into a `bb thread spawn ...` command shown to
+    // a downstream agent as "the exact command to run" (see renderWorkflow
+    // below) — an unconstrained string here is a shell-injection vector for
+    // anything that can call `chief workflow create`, including an agent.
+    const harnessToken = z
+      .string()
+      .regex(
+        /^[A-Za-z0-9._-]+$/,
+        "must contain only letters, digits, '.', '_', or '-' — it is rendered into a shell command",
+      );
     const workflowStepSchema = z.object({
       name: z.string().min(1),
       instructions: z.string().min(1),
-      providerId: z.string().optional(),
-      model: z.string().optional(),
+      providerId: harnessToken.optional(),
+      model: harnessToken.optional(),
     });
     const result = z.array(workflowStepSchema).min(1).safeParse(parsed);
     if (!result.success) {
@@ -2060,33 +2060,20 @@ export default async function plugin(bb: BbPluginApi) {
    * task-related goes through it). It is not declared anywhere in the
    * manifest — there is no such field — so a fresh install of this plugin
    * alone leaves it silently missing until something tries to use it and
-   * fails. Installing it here, once, closes that gap. Chief's org (Chief,
-   * project chiefs, task architects) is native to this plugin now, so it
-   * needs no separate install.
+   * fails. Installing a plugin changes the user's environment, so this only
+   * ever checks; `installTasksPlugin` below is the explicit, user-clicked
+   * action that actually installs it. Chief's org (Chief, project chiefs,
+   * task architects) is native to this plugin now, so it needs no separate
+   * install.
    */
-  async function ensureCompanionPlugins(): Promise<void> {
-    let ids: Set<string>;
+  async function isPluginInstalled(id: string): Promise<boolean> {
     try {
-      ids = new Set((await bb.sdk.plugins.list()).plugins.map((entry) => entry.id));
+      return (await bb.sdk.plugins.list()).plugins.some((entry) => entry.id === id);
     } catch (error) {
       bb.log.warn(`could not check installed plugins: ${String(error)}`);
-      return;
-    }
-    if (!ids.has("tasks")) {
-      try {
-        await bb.sdk.plugins.install({ source: "builtin:tasks" });
-        bb.log.info("installed the Tasks plugin (command-center depends on it)");
-      } catch (error) {
-        bb.log.warn(`could not auto-install the Tasks plugin: ${String(error)}`);
-      }
+      return true; // Unknown — do not claim it is missing and prompt wrongly.
     }
   }
-
-  bb.background.service("ensure-companions", {
-    async start() {
-      await ensureCompanionPlugins();
-    },
-  });
 
   // The rail shows live thread status, so every lifecycle transition of a
   // thread we track is a reason to refetch.
@@ -2581,9 +2568,11 @@ export default async function plugin(bb: BbPluginApi) {
       row.title,
       ...(row.body.trim() !== "" ? ["", row.body.trim()] : []),
       "",
-      "No Chief org is reachable right now, so there is nobody to route this to — you are its accountable owner end to end. Do it yourself, or fan out to delegates you coordinate, but stay the one thread the Captain can check on.",
+      "This is a lean, one-thread dispatch — no project chief or architect above you. Do the task yourself in one pass and park it in review; only fan out to a delegate thread if the task genuinely needs a second pair of hands (e.g. an independent reviewer), not by default.",
       `First: \`bb tasks create --title "…" --description "…" --json\` for a task key, then \`bb command-center ack ${row.id} --task-key <key>\` so this lands on the right card, then \`bb tasks attach <key> --thread $BB_THREAD_ID\`.`,
+      `When it's ready for the Captain to look at: \`bb command-center ready ${row.id} --outcome "…"\` (or set the task to in_review).`,
       `Escalate decisions through the Inbox: \`bb command-center ask --task "<key>" --task-key "<key>" --question "…" --option … --asked-by "worker: <key>"\`. Point at this thread for review: \`bb command-center review --task "<key>" --task-key "<key>" --question "…" --thread $BB_THREAD_ID\`.`,
+      "The Captain may come back with a comment asking for another pass (e.g. \"get a second opinion from codex before this is done\") — that lands as a message in this same thread; act on it, including spawning a one-off delegate thread for that specific ask if that's what it takes.",
       `Close it when it lands or is abandoned: \`bb command-center close ${row.id} --outcome "…"\`.`,
       workflowSection,
     ].join("\n");
@@ -2593,12 +2582,13 @@ export default async function plugin(bb: BbPluginApi) {
   function directWakeBrief(task: TaskRow, mission: string): string {
     return [
       `You are the accountable owner of ${task.key}: ${task.title}.`,
-      "No Chief org is reachable right now, so there is no architect hierarchy above you — you report to nobody but the Captain, through the Inbox.",
+      "This is a lean, one-thread dispatch — no project chief or architect above you; you report to nobody but the Captain, through the Inbox.",
       "",
       mission,
       "",
       `Attach yourself to the task: \`bb tasks attach ${task.key} --thread $BB_THREAD_ID\`.`,
       `Escalate decisions: \`bb command-center ask --task "${task.key}" --task-key "${task.key}" --question "…" --option … --asked-by "worker: ${task.key}"\`. Point at this thread for review: \`bb command-center review --task "${task.key}" --task-key "${task.key}" --question "…" --thread $BB_THREAD_ID\`.`,
+      "The Captain may come back with a comment asking for another pass (e.g. a second reviewer) — act on it, spawning a one-off delegate thread for that specific ask if that's what it takes.",
       `Keep status current: \`bb tasks update ${task.key} --status <status>\`.`,
     ].join("\n");
   }
@@ -2625,6 +2615,21 @@ export default async function plugin(bb: BbPluginApi) {
       status: null,
       error: "No Chief thread found. Start Chief in the Chief panel.",
     };
+  }
+
+  /**
+   * Lean by default: a project only goes through Chief's project-chief/
+   * architect hierarchy once the Captain has actually stood up a project
+   * chief for it (via `chief_project_chief` or `bb command-center chief
+   * project-chief`). A project with no history yet dispatches straight to a
+   * worker thread — one hop, one thread, no routing ceremony — even while
+   * Chief itself is running for other projects.
+   */
+  async function projectHasLiveChief(projectId: string | null): Promise<boolean> {
+    if (projectId === null) return false;
+    const row = projectChiefRow(projectId);
+    if (row === null || row.retired === 1) return false;
+    return (await statusOf(row.thread_id)) !== null;
   }
 
   function dispatchBrief(row: RequestRow, projectName: string | null): string {
@@ -2687,11 +2692,14 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
 
-    // Chief is preferred whenever it is reachable — it routes into the org's
-    // project-chief/architect hierarchy. When it isn't, dispatch still has to
-    // work, so this spawns the worker directly instead of just failing.
-    const chief = await chiefThread();
-    if (chief.threadId !== null) {
+    const projectId = row.project_id ?? (await settings.get()).defaultProject ?? null;
+
+    // Chief's org is opt-in per project: only a project the Captain has
+    // already put under a project chief routes through the hierarchy. Every
+    // other project — including one Chief has never seen — dispatches
+    // straight to a worker thread, no routing hops.
+    const chief = (await projectHasLiveChief(projectId)) ? await chiefThread() : null;
+    if (chief !== null && chief.threadId !== null) {
       try {
         await bb.sdk.threads.send({
           threadId: chief.threadId,
@@ -2714,12 +2722,11 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true, threadId: chief.threadId, error: null };
     }
 
-    const projectId = row.project_id ?? (await settings.get()).defaultProject ?? null;
     if (projectId === null) {
       return {
         ok: false,
         threadId: null,
-        error: "No Chief org, and no project to dispatch into — pick a project or set a default one.",
+        error: "No project to dispatch into — pick a project or set a default one.",
       };
     }
     try {
@@ -2741,7 +2748,7 @@ export default async function plugin(bb: BbPluginApi) {
          WHERE id = ?`,
       ).run(threadId, Date.now(), id);
       publish();
-      bb.log.info(`dispatched ${id} directly to ${threadId} (no Chief org)`);
+      bb.log.info(`dispatched ${id} directly to ${threadId} (no project chief for this project)`);
       return { ok: true, threadId, error: null };
     } catch (error) {
       return { ok: false, threadId: null, error: String(error) };
@@ -3152,7 +3159,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function buildBoard(
     options: { enrich?: boolean } = {},
-  ): Promise<{ cards: BoardCard[]; tasksError: string | null }> {
+  ): Promise<{ cards: BoardCard[]; tasksError: string | null; tasksMissing: boolean }> {
     // The notification sweep only needs lanes, and enrichment costs a Tasks
     // round trip per card plus a git-host call for anything in review.
     const shouldEnrich = options.enrich !== false;
@@ -3162,11 +3169,13 @@ export default async function plugin(bb: BbPluginApi) {
 
     let tasks: TaskRow[] = [];
     let tasksError: string | null = null;
+    let tasksMissing = false;
     try {
       tasks = await listAllTasks();
     } catch (error) {
       tasksError = `Tasks plugin unreachable: ${String(error)}`;
       bb.log.warn(tasksError);
+      tasksMissing = !(await isPluginInstalled("tasks"));
     }
     const taskByKey = new Map(tasks.map((task) => [task.key, task]));
     // Every task key genuinely on the board, for the fallback match above —
@@ -3400,7 +3409,7 @@ export default async function plugin(bb: BbPluginApi) {
       }),
     );
 
-    return { cards, tasksError };
+    return { cards, tasksError, tasksMissing };
   }
 
   // ------------------------------------------------------------ notifying
@@ -3787,17 +3796,6 @@ export default async function plugin(bb: BbPluginApi) {
       .join(" ");
   }
 
-  function answerPrompt(item: InboxItem): string {
-    return [
-      `A spoken answer to the question: ${item.question}`,
-      item.options.length > 0
-        ? `Expected answers: ${item.options.join(", ")}.`
-        : "",
-    ]
-      .filter((part) => part !== "")
-      .join(" ");
-  }
-
   async function transcribe(
     clip: { audioBase64: string; mimeType: string; filename: string },
     prompt?: string,
@@ -3931,7 +3929,17 @@ export default async function plugin(bb: BbPluginApi) {
         chiefThreadId: chief.threadId,
         chiefError: chief.error,
         tasksError: built.tasksError,
+        tasksMissing: built.tasksMissing,
       };
+    },
+    async installTasksPlugin() {
+      try {
+        await bb.sdk.plugins.install({ source: "builtin:tasks" });
+        publish();
+        return { ok: true, error: null };
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
     },
     async moveCard({ cardId, lane }) {
       return await moveCard(cardId, lane);
@@ -4118,21 +4126,26 @@ export default async function plugin(bb: BbPluginApi) {
         ...(recentComments.length > 0 ? recentComments : ["(no prior comments)"]),
       ].join("\n");
 
-      // Chief is preferred whenever it is reachable — same reasoning as
-      // dispatch. When it isn't, spawn the replacement worker directly.
+      // Same routing rule as dispatch: only a project already under a
+      // project chief goes through Chief's hierarchy. Everything else wakes
+      // the task with a lean, single worker thread.
       let newThreadId: string;
-      try {
-        const result = await handoff(
-          {
-            taskKey: task.key,
-            title: task.title,
-            mission,
-            projectId,
-          },
-          null,
-        );
-        newThreadId = result.threadId;
-      } catch (chiefError) {
+      if (await projectHasLiveChief(projectId)) {
+        try {
+          const result = await handoff(
+            {
+              taskKey: task.key,
+              title: task.title,
+              mission,
+              projectId,
+            },
+            null,
+          );
+          newThreadId = result.threadId;
+        } catch (error) {
+          return { ok: false, threadId: null, error: String(error) };
+        }
+      } else {
         try {
           const preferred = await dispatchPreferenceFor(task.key);
           const direct = await spawnWorkerDirect({
@@ -4144,9 +4157,7 @@ export default async function plugin(bb: BbPluginApi) {
           });
           newThreadId = direct.threadId;
         } catch (error) {
-          bb.log.warn(
-            `wakeTask failed for ${task.key}: no Chief org (${String(chiefError)}), then direct spawn also failed: ${String(error)}`,
-          );
+          bb.log.warn(`wakeTask failed for ${task.key}: ${String(error)}`);
           return { ok: false, threadId: null, error: String(error) };
         }
       }
@@ -4511,21 +4522,6 @@ export default async function plugin(bb: BbPluginApi) {
         understood: parsed.understood,
       };
     },
-    async voiceAnswer(input) {
-      const row = getItem(input.itemId);
-      if (row === undefined) {
-        throw new Error(`No item ${input.itemId}.`);
-      }
-      const item = toItem(row);
-      const transcript = await transcribe(input, answerPrompt(item));
-      const best = matchSpokenOption(transcript, item.options);
-      return {
-        transcript,
-        option: best?.option ?? null,
-        confidence: best?.confidence ?? 0,
-        options: matchSpokenOptions(transcript, item.options),
-      };
-    },
     async parseVoice({ transcript }) {
       const parsed = parseVoiceCommand(transcript, await voiceProjects());
       return {
@@ -4652,15 +4648,15 @@ export default async function plugin(bb: BbPluginApi) {
     commands: [
       {
         name: "ask",
-        summary: "Ask the user a question",
+        summary: "Notify the user something needs them, without a form",
         usage:
-          'bb command-center ask --task "…" --question "…" [--option A --option B | --multi | --input] [--asked-by "…"] [--urgent] [--wait]',
+          'bb command-center ask --task "…" --question "…" [--asked-by "…"] [--urgent] [--wait]',
       },
       {
         name: "review",
         summary: "Ask the user to look at a thread or URL",
         usage:
-          'bb command-center review --task "…" --question "…" --thread <id> | --url <url> [--option Approve]',
+          'bb command-center review --task "…" --question "…" --thread <id> | --url <url>',
       },
       {
         name: "list",
@@ -4768,7 +4764,6 @@ export default async function plugin(bb: BbPluginApi) {
           if (question === undefined) {
             return { exitCode: 1, stderr: "--question is required." };
           }
-          const options = parsed.flags["option"] ?? [];
           const isReview = command === "review";
           const reviewThreadId = first(parsed, "thread") ?? null;
           const reviewUrl = first(parsed, "url") ?? null;
@@ -4783,21 +4778,16 @@ export default async function plugin(bb: BbPluginApi) {
           if (reviewUrl !== null && !isHttpUrl(reviewUrl)) {
             return { exitCode: 1, stderr: "--url must be an http(s) URL." };
           }
-          const kind = isReview
-            ? "review"
-            : has(parsed, "multi")
-              ? "multi"
-              : has(parsed, "input")
-                ? "text"
-                : options.length > 0
-                  ? "options"
-                  : "ack";
+          // Deliberately no options/multi/text kinds — this is a notification,
+          // not a form. Point at the thread (or a task moved to in_review) and
+          // let the Captain reply there directly; dismiss is the only way an
+          // item closes.
           const id = insertItem({
             task: first(parsed, "task") ?? "",
             question,
-            kind,
-            options,
-            placeholder: textFlag(parsed, "placeholder") ?? null,
+            kind: isReview ? "review" : "ack",
+            options: [],
+            placeholder: null,
             taskKey: textFlag(parsed, "task-key") ?? null,
             threadId: first(parsed, "ask-thread") ?? ctx.threadId ?? null,
             projectId: first(parsed, "project") ?? ctx.projectId ?? null,
@@ -4813,7 +4803,7 @@ export default async function plugin(bb: BbPluginApi) {
               exitCode: 0,
               stdout: json
                 ? JSON.stringify({ id, status: "open" })
-                : `Asked (${id}). The answer will be delivered into this thread when the user resolves it.`,
+                : `Asked (${id}). Reply in this thread directly — the Captain dismisses the notification once handled.`,
             };
           }
 
@@ -5108,9 +5098,12 @@ export default async function plugin(bb: BbPluginApi) {
           if (!result.ok) {
             return { exitCode: 1, stderr: result.error ?? "Dispatch failed." };
           }
+          const viaChief = result.threadId === chiefRow()?.thread_id;
           return {
             exitCode: 0,
-            stdout: `Dispatched ${id} to Chief (${result.threadId}).`,
+            stdout: viaChief
+              ? `Dispatched ${id} to Chief (${result.threadId}).`
+              : `Dispatched ${id} directly (${result.threadId}) — no project chief for this project yet.`,
           };
         }
 

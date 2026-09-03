@@ -45,12 +45,13 @@ yourself before it counts as done; never forward it unread.
 
 ## When you are blocked
 
-Ask through the Inbox — with a recommendation and 2–3 concrete choices, so the
-Captain answers in one click:
+Ask through the Inbox — a plain question with your recommendation stated in
+it. It's a notification, not a form; the Captain replies in this thread's
+chat, not by picking a button:
 
 ```
 bb command-center ask --task "<key>" --task-key "<key>" --question "…" \
-  --option "…" --option "…" --asked-by "architect: <key>"
+  --asked-by "architect: <key>"
 ```
 
 **Always pass `--task-key`.** `--task` alone is a label — without `--task-key`
